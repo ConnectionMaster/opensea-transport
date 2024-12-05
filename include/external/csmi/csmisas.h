@@ -115,14 +115,25 @@ Revision History:
 /* TARGET OS LINUX SPECIFIC CODE                                         */
 /*************************************************************************/
 
-// EDM #ifdef _linux
-#ifdef __KERNEL__
+#ifdef __unix__
+//#ifdef __KERNEL__
 
 // Linux base types
-
-#include <linux/types.h>
-
-#define __i8    char
+#if defined __linux__
+   #include <linux/types.h>
+   #define __i8    char
+#else
+   #define __i8    char
+   #define __u8    unsigned char
+   #define __u16   unsigned short
+   #ifndef __LP64__
+      #define __u32   unsigned long
+      #define __u64   unsigned long long
+   #else
+      #define __u32   unsigned int
+      #define __u64   unsigned long
+   #endif //__LP64__
+#endif //__linux__
 
 // pack definition
 
@@ -545,6 +556,8 @@ typedef struct _IOCTL_HEADER {
 
 // RAID Data Type
 // (bDataType)
+//NOTE: In v0.81, this was reserved. Any odd reporting that does not match below definitions should be ignored.
+//     Use the CSMI version info from the driver to determine when to check these values -TJE
 #define CSMI_SAS_RAID_DATA_DRIVES           0
 #define CSMI_SAS_RAID_DATA_DEVICE_ID        1
 #define CSMI_SAS_RAID_DATA_ADDITIONAL_DATA  2
@@ -603,7 +616,7 @@ typedef struct _IOCTL_HEADER {
 #define CSMI_SAS_RAID_FEATURE_SPARES_SHARED     0x00000040
 
 // RAID Priority
-// (bDefaultTransformPriority, etc.)
+// (bDefaultTransformPriority, bTransformPriority, bDefaultRebuildPriority, bRebuildPriority, bDefaultSurfaceScanPriority, bSurfaceScanPriority)
 #define CSMI_SAS_PRIORITY_UNKNOWN   0
 #define CSMI_SAS_PRIORITY_UNCHANGED 0
 #define CSMI_SAS_PRIORITY_AUTO      1
@@ -1245,7 +1258,7 @@ typedef struct _CSMI_SAS_RAID_CONFIG {
    __u8  bStatus;
    __u8  bInformation;
    __u8  bDriveCount;
-   __u8  bDataType;
+   __u8  bDataType;          //Important NOTE: v81 this is reserved until the drives structure(20B). Intel uses this to store the ASCII name assigned to the RAID starting at this location. - TJE
    __u8  bReserved[11];
    __u32 uFailureCode;
    __u32 uChangeCount;

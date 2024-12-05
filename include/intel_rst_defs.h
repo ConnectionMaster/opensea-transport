@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -17,9 +18,8 @@
 #if defined (_WIN32)
 
 #include <windows.h>
-#if !defined(NTDDSCSI_INCLUDED)
+#if !defined(_NTDDSCSIH_)
 #include <ntddscsi.h>
-#define NTDDSCSI_INCLUDED
 #endif
 
 #if defined (__cplusplus)
@@ -38,7 +38,6 @@ extern "C"
 
     #define NVME_PASS_THROUGH_VERSION 1
 
-    //TODO: Update field names???
     typedef struct _GENERIC_COMMAND {
         ULONG DWord0;
         ULONG DWord1;
@@ -58,7 +57,6 @@ extern "C"
         ULONG DWord15;
     }GENERIC_COMMAND;
     
-    //TODO: Update field names???
     typedef struct _COMPLETION_QUEUE_ENTRY {
         ULONG completion0;
         ULONG completion1;
@@ -153,7 +151,11 @@ CTL_CODE(0xF000, 0x010, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #if defined (_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable:4200) // nonstandard extension used : zero-sized array in struct/union
-#endif
+#endif //_MSC_VER
+#if defined (__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wzero-length-array"
+#endif //__clang__
     typedef struct _IOCTL_RAID_FIRMWARE_BUFFER {
         SRB_IO_CONTROL Header;
         RAID_FIRMWARE_REQUEST_BLOCK Request;
@@ -161,7 +163,10 @@ CTL_CODE(0xF000, 0x010, METHOD_BUFFERED, FILE_ANY_ACCESS)
     }IOCTL_RAID_FIRMWARE_BUFFER;
 #if defined (_MSC_VER)
 #pragma warning(pop)//disable warning 4200
-#endif
+#endif //_MSC_VER
+#if defined (__clang__)
+#pragma clang diagnostic pop
+#endif //__clang__
 
     //The RAID FW ioctl can send only STORAGE_FIRMWARE_INFO_V2, STORAGE_FIRMWARE_DOWNLOAD_V2, STORAGE_FIRMWARE_ACTIVATE
     //These are redefined here so that an up to date Windows API is not required to compile this code.
@@ -185,7 +190,11 @@ CTL_CODE(0xF000, 0x010, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #if defined (_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable:4200) // nonstandard extension used : zero-sized array in struct/union
-#endif
+#endif //_MSC_VER
+#if defined (__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wzero-length-array"
+#endif //__clang__
     typedef struct _INTEL_STORAGE_FIRMWARE_INFO_V2 {
 
         ULONG   Version;        // INTEL_STORAGE_FIRMWARE_INFO_STRUCTURE_VERSION_V2
@@ -226,7 +235,10 @@ CTL_CODE(0xF000, 0x010, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #if defined (_MSC_VER)
 #pragma warning(pop)//disable warning 4200
-#endif
+#endif //_MSC_VER
+#if defined (__clang__)
+#pragma clang diagnostic pop
+#endif //__clang__
 
 #define INTEL_STORAGE_FIRMWARE_ACTIVATE_STRUCTURE_VERSION         0x1
 
@@ -427,25 +439,25 @@ CTL_CODE(0xF000, 0xE00, METHOD_BUFFERED, FILE_ANY_ACCESS)
     #define INTEL_SRB_STATUS_INVALID_PARAMETER        0x28
 
     //TODO: Are these the SRB status's for firmware, similar to the miniport in Windows to use when doing firmware updates instead???-TJE
-#define INTEL_FIRMWARE_STATUS_SUCCESS                             0x0
-#define INTEL_FIRMWARE_STATUS_ERROR                               0x1
-#define INTEL_FIRMWARE_STATUS_ILLEGAL_REQUEST                     0x2
-#define INTEL_FIRMWARE_STATUS_INVALID_PARAMETER                   0x3
-#define INTEL_FIRMWARE_STATUS_INPUT_BUFFER_TOO_BIG                0x4
-#define INTEL_FIRMWARE_STATUS_OUTPUT_BUFFER_TOO_SMALL             0x5
-#define INTEL_FIRMWARE_STATUS_INVALID_SLOT                        0x6
-#define INTEL_FIRMWARE_STATUS_INVALID_IMAGE                       0x7
-#define INTEL_FIRMWARE_STATUS_CONTROLLER_ERROR                    0x10
-#define INTEL_FIRMWARE_STATUS_POWER_CYCLE_REQUIRED                0x20
-#define INTEL_FIRMWARE_STATUS_DEVICE_ERROR                        0x40
-#define INTEL_FIRMWARE_STATUS_INTERFACE_CRC_ERROR                 0x80
-#define INTEL_FIRMWARE_STATUS_UNCORRECTABLE_DATA_ERROR            0x81
-#define INTEL_FIRMWARE_STATUS_MEDIA_CHANGE                        0x82
-#define INTEL_FIRMWARE_STATUS_ID_NOT_FOUND                        0x83
-#define INTEL_FIRMWARE_STATUS_MEDIA_CHANGE_REQUEST                0x84
-#define INTEL_FIRMWARE_STATUS_COMMAND_ABORT                       0x85
-#define INTEL_FIRMWARE_STATUS_END_OF_MEDIA                        0x86
-#define INTEL_FIRMWARE_STATUS_ILLEGAL_LENGTH                      0x87
+    #define INTEL_FIRMWARE_STATUS_SUCCESS                             0x0
+    #define INTEL_FIRMWARE_STATUS_ERROR                               0x1
+    #define INTEL_FIRMWARE_STATUS_ILLEGAL_REQUEST                     0x2
+    #define INTEL_FIRMWARE_STATUS_INVALID_PARAMETER                   0x3
+    #define INTEL_FIRMWARE_STATUS_INPUT_BUFFER_TOO_BIG                0x4
+    #define INTEL_FIRMWARE_STATUS_OUTPUT_BUFFER_TOO_SMALL             0x5
+    #define INTEL_FIRMWARE_STATUS_INVALID_SLOT                        0x6
+    #define INTEL_FIRMWARE_STATUS_INVALID_IMAGE                       0x7
+    #define INTEL_FIRMWARE_STATUS_CONTROLLER_ERROR                    0x10
+    #define INTEL_FIRMWARE_STATUS_POWER_CYCLE_REQUIRED                0x20
+    #define INTEL_FIRMWARE_STATUS_DEVICE_ERROR                        0x40
+    #define INTEL_FIRMWARE_STATUS_INTERFACE_CRC_ERROR                 0x80
+    #define INTEL_FIRMWARE_STATUS_UNCORRECTABLE_DATA_ERROR            0x81
+    #define INTEL_FIRMWARE_STATUS_MEDIA_CHANGE                        0x82
+    #define INTEL_FIRMWARE_STATUS_ID_NOT_FOUND                        0x83
+    #define INTEL_FIRMWARE_STATUS_MEDIA_CHANGE_REQUEST                0x84
+    #define INTEL_FIRMWARE_STATUS_COMMAND_ABORT                       0x85
+    #define INTEL_FIRMWARE_STATUS_END_OF_MEDIA                        0x86
+    #define INTEL_FIRMWARE_STATUS_ILLEGAL_LENGTH                      0x87
 
 
 

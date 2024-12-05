@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -18,9 +19,7 @@
 #include "scsi_helper.h"
 #include "sat_helper.h"
 #include "common_public.h"
-#if !defined(DISABLE_NVME_PASSTHROUGH)
 #include "nvme_helper.h"
-#endif
 
 #if defined (__cplusplus)
 extern "C"
@@ -65,7 +64,7 @@ extern "C"
 #define CAM_MAX_CMD_TIMEOUT_SECONDS 4294967
 
     //If this returns true, a timeout can be sent with INFINITE_TIMEOUT_VALUE definition and it will be issued, otherwise you must try MAX_CMD_TIMEOUT_SECONDS instead
-    bool os_Is_Infinite_Timeout_Supported(void);
+    OPENSEA_TRANSPORT_API bool os_Is_Infinite_Timeout_Supported(void);
 
     //-----------------------------------------------------------------------------
     //
@@ -80,7 +79,7 @@ extern "C"
     //!   \return SUCCESS = good, !SUCCESS something went wrong see error codes
     //
     //-----------------------------------------------------------------------------
-    int send_Scsi_Cam_IO( ScsiIoCtx *scsiIoCtx );
+    eReturnValues send_Scsi_Cam_IO( ScsiIoCtx *scsiIoCtx );
 
     //-----------------------------------------------------------------------------
     //
@@ -95,7 +94,7 @@ extern "C"
     //!   \return SUCCESS = good, !SUCCESS something went wrong see error codes
     //
     //-----------------------------------------------------------------------------
-    int send_Ata_Cam_IO( ScsiIoCtx *scsiIoCtx );
+    eReturnValues send_Ata_Cam_IO( ScsiIoCtx *scsiIoCtx );
 
     //-----------------------------------------------------------------------------
     //
@@ -110,7 +109,7 @@ extern "C"
     //!   \return SUCCESS = good, !SUCCESS something went wrong see error codes
     //
     //-----------------------------------------------------------------------------
-    int send_IO( ScsiIoCtx *scsiIoCtx );
+    eReturnValues send_IO( ScsiIoCtx *scsiIoCtx );
 
     //-----------------------------------------------------------------------------
     //
@@ -126,7 +125,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = failed to perform the reset
     //
     //-----------------------------------------------------------------------------
-    int os_Device_Reset(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues os_Device_Reset(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -142,7 +141,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = failed to perform the reset
     //
     //-----------------------------------------------------------------------------
-    int os_Bus_Reset(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues os_Bus_Reset(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -158,9 +157,8 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = failed to perform the reset
     //
     //-----------------------------------------------------------------------------
-    int os_Controller_Reset(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues os_Controller_Reset(tDevice *device);
 
-#if !defined(DISABLE_NVME_PASSTHROUGH)
     //-----------------------------------------------------------------------------
     //
     //  pci_Read_Bar_Reg()
@@ -179,7 +177,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    int pci_Read_Bar_Reg(tDevice * device, uint8_t * pData, uint32_t dataSize);
+    eReturnValues pci_Read_Bar_Reg(tDevice * device, uint8_t * pData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -194,13 +192,11 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    int send_NVMe_IO(nvmeCmdCtx *nvmeIoCtx);
+    eReturnValues send_NVMe_IO(nvmeCmdCtx *nvmeIoCtx);
 
-    int os_nvme_Reset(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues os_nvme_Reset(tDevice *device);
 
-    int os_nvme_Subsystem_Reset(tDevice *device);
-
-#endif
+    OPENSEA_TRANSPORT_API eReturnValues os_nvme_Subsystem_Reset(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -215,7 +211,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = failed to perform the reset
     //
     //-----------------------------------------------------------------------------
-    int os_Lock_Device(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues os_Lock_Device(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -230,12 +226,16 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = failed to perform the reset
     //
     //-----------------------------------------------------------------------------
-    int os_Unlock_Device(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues os_Unlock_Device(tDevice *device);
 
-    int os_Update_File_System_Cache(tDevice* device);
+    OPENSEA_TRANSPORT_API eReturnValues os_Update_File_System_Cache(tDevice* device);
 
-    #if defined (__cplusplus)
+    OPENSEA_TRANSPORT_API eReturnValues os_Unmount_File_Systems_On_Device(tDevice *device);
+
+    OPENSEA_TRANSPORT_API eReturnValues os_Erase_Boot_Sectors(tDevice* device);
+
+#if defined (__cplusplus)
 }
-    #endif
+#endif
 
 #endif

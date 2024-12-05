@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2020-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2020-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -12,12 +13,23 @@
 // \file sata_helper_func.c
 // \brief functions to help with SATA specific things. Printing out FIS, creating FIS, etc.
 
+#include "common_types.h"
+#include "precision_timer.h"
+#include "memory_safety.h"
+#include "type_conversion.h"
+#include "string_utils.h"
+#include "bit_manip.h"
+#include "code_attributes.h"
+#include "math_utils.h"
+#include "error_translation.h"
+#include "io_utils.h"
+
 #include "sata_types.h"
 #include "sata_helper_func.h"
 
-int build_H2D_FIS_From_ATA_PT_Command(ptrSataH2DFis h2dFis, ataTFRBlock *ataPTCmd, uint8_t pmPort)
+eReturnValues build_H2D_FIS_From_ATA_PT_Command(ptrSataH2DFis h2dFis, ataTFRBlock *ataPTCmd, uint8_t pmPort)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     if (!h2dFis || !ataPTCmd)
     {
         return BAD_PARAMETER;
@@ -290,9 +302,9 @@ void print_FIS(void *fis, uint32_t fisLengthBytes)
                 printf("\tFisType:\t%02" PRIX8 " - Unknown\n", fisPtr[0]);
             }
             //start loop at 1 since we've already printed the first byte describing the type of FIS
-            for (uint8_t fisIter = 1; fisIter < 20; ++fisIter)
+            for (uint8_t fisIter = 1; fisIter < UNKNOWN_FIS_TYPE_LENGTH; ++fisIter)
             {
-                printf("\tFIS[%" PRIu8 "]:\t%02" PRIX8 "\n", fisIter, fisPtr[fisIter]);
+                printf("\tFIS[%2" PRIu8 "]:\t%02" PRIX8 "\n", fisIter, fisPtr[fisIter]);
             }
             printf("\n");
             break;

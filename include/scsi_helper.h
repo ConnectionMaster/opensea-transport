@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -14,6 +15,9 @@
 
 #pragma once
 
+#include "common_types.h"
+#include "type_conversion.h"
+#include "memory_safety.h"
 #include "common_public.h"
 #include "ata_helper.h"
 
@@ -22,10 +26,17 @@ extern "C"
 {
 #endif
 
+    #define INQ_RETURN_DATA_LENGTH_SCSI2 (36)
     #define INQ_RETURN_DATA_LENGTH      (96)
     #define INQ_DATA_T10_VENDOR_ID_LEN  (8) //bytes
     #define INQ_DATA_PRODUCT_ID_LEN     (16)
     #define INQ_DATA_PRODUCT_REV_LEN    (4)
+
+    #define INQ_RESPONSE_FMT_SCSI       (0) //original response format - basically all vendor unique information
+    #define INQ_RESPONSE_FMT_CCS        (1) //SCSI common command set definition. More or less meets modern requirements
+    #define INQ_RESPONSE_FMT_CURRENT    (2) //SCSI2 and later all use this format to report inquiry data
+
+    #define INQ_MAX_VERSION_DESCRIPTORS (8)
 
     typedef enum _eSCSIVersion 
     {
@@ -38,6 +49,8 @@ extern "C"
         SCSI_VERSION_SPC_3          = 5,
         SCSI_VERSION_SPC_4          = 6,
         SCSI_VERSION_SPC_5          = 7,
+        //jump past 08-0C as these were used for asni, iso, emca combination value standard identification and are obsolete.
+        SCSI_VERSION_SPC_6          = 0x0D,
     }eSCSIVersion;
 
     typedef enum _eCDBLen{
@@ -72,7 +85,8 @@ extern "C"
         SENSE_KEY_VENDOR_SPECIFIC = 0x09,
         SENSE_KEY_COPY_ABORTED    = 0x0A,
         SENSE_KEY_ABORTED_COMMAND = 0x0B,
-        SENSE_KEY_RESERVED        = 0x0C,
+        SENSE_KEY_EQUAL           = 0x0C,//scsi and scsi 2 defined this as "EQUAL" to say a "search data" command found an equal comparison.
+        SENSE_KEY_RESERVED        = 0x0C,//marked obsolete in SPC3 and reserved in later standards
         SENSE_KEY_VOLUME_OVERFLOW = 0x0D,
         SENSE_KEY_MISCOMPARE      = 0x0E,
         SENSE_KEY_COMPLETED       = 0x0F
@@ -108,7 +122,7 @@ extern "C"
     #define SCSI_SENSE_INFO_FIELD_MSB_INDEX  (3)
     #define SCSI_FIXED_FORMAT_CMD_INFO_INDEX (8)
 
-    #define SCSI_MAX_21_LBA 0x001FFFFF //read/write 6byte commands
+    #define SCSI_MAX_21_LBA UINT32_C(0x001FFFFF) //read/write 6byte commands
     #define SCSI_MAX_32_LBA UINT32_MAX
     #define SCSI_MAX_64_LBA UINT64_MAX
 
@@ -242,6 +256,10 @@ extern "C"
         uint8_t additionalDataOffset;//if bool above is set, then this will be set to the offset of the additional data that couldn't be parsed
     }senseDataFields, *ptrSenseDataFields;
 
+    static M_INLINE void safe_free_sensefields(senseDataFields **sensefields)
+    {
+        safe_Free(M_REINTERPRET_CAST(void**, sensefields));
+    }
 
     typedef struct _biDirectionalCommandBuffers
     {
@@ -269,7 +287,7 @@ extern "C"
         tDevice          *device;
         uint8_t         cdb[64]; //64 just so if we ever get there.
         uint8_t         cdbLength;
-        int8_t          direction;
+        eDataTransferDirection direction;
         uint8_t         *pdata;
         uint32_t        dataLength;
         uint8_t         *psense;
@@ -305,6 +323,18 @@ extern "C"
         SANITIZE_OVERWRITE_VENDOR3      = 0x03
     }eScsiSanitizeOverwriteTest;
 
+    typedef enum _eReadBufferMode
+    {
+        SCSI_RB_COMBINED_HEADER_AND_DATA                                = 0x00, //obsolete (see SPC or SCSI2)
+        SCSI_RB_VENDOR_SPECIFIC                                         = 0x01,
+        SCSI_RB_DATA                                                    = 0x02,
+        SCSI_RB_DESCRIPTOR                                              = 0x03,
+        SCSI_RB_READ_DATA_FROM_ECHO_BUFFER                              = 0x0A,
+        SCSI_RB_ECHO_BUFFER_DESCRIPTOR                                  = 0x0B,
+        SCSI_RB_READ_MICROCODE_STATUS                                   = 0x0F,
+        SCSI_RB_ENABLE_EXPANDER_COMMUNICATIONS_PROTOCOL_AND_ECHO_BUFFER = 0x1A, //obsolete (See SPC3)
+        SCSI_RB_ERROR_HISTORY                                           = 0x1C,
+    }eReadBufferMode;
 
     typedef enum _eWriteBufferMode
     {
@@ -357,6 +387,7 @@ extern "C"
         COMPARE_AND_WRITE                           = 0x89,
         EXTENDED_COPY                               = 0x83,
         SCSI_FORMAT_UNIT_CMD                        = 0x04,
+        SCSI_FORMAT_WITH_PRESET_CMD                 = 0x38,
         CHANGE_ALIASES_CMD                          = 0xA4,
         GET_LBA_STATUS                              = 0x9E,
         INQUIRY_CMD                                 = 0x12,
@@ -487,6 +518,7 @@ extern "C"
         BLOCK_LIMITS_EXTENSION                          = 0xB7,
         FORMAT_PRESETS                                  = 0xB8,
         CONCURRENT_POSITIONING_RANGES                   = 0xB9,
+        CAPACITY_PRODUCT_IDENTIFICATION_MAPPING         = 0xBA,
         //C0h - FFh are Vendor specific
     }eScsiVpdPages;
 
@@ -499,6 +531,7 @@ extern "C"
         VPD_ATA_INFORMATION_LEN = 572,
         VPD_BLOCK_LIMITS_LEN = 64,//length if from SBC4
         VPD_LOGICAL_BLOCK_PROVISIONING_LEN = 8,//This is only a correct length if there are no provisioning group descriptors
+        VPD_ZONED_BLOCK_DEVICE_CHARACTERISTICS_LEN  = 64,//ZBC-2
     }ScsiVPDPageLengths;
 
     typedef enum _eScsiModePageControl
@@ -623,16 +656,28 @@ extern "C"
         LP_INFORMATION_EXCEPTIONS_LEN = 12,//setting to 12 since a SAT device will only likely return 12 bytes of data....this shouldn't be used when reading this page from a SAS device.
     }eScsiLogPageLengths;
 
-    #define MODE_PARAMETER_HEADER_6_LEN 4
-    #define MODE_PARAMETER_HEADER_10_LEN 8
+    #define MODE_PARAMETER_HEADER_6_LEN  UINT8_C(4)
+    #define MODE_PARAMETER_HEADER_10_LEN UINT8_C(8)
 
-    #define SHORT_LBA_BLOCK_DESCRIPTOR_LEN 8 //for mode sense/select 6
-    #define LONG_LBA_BLOCK_DESCRIPTOR_LEN 16 //for mode sense/select 10
+    #define SHORT_LBA_BLOCK_DESCRIPTOR_LEN UINT8_C(8) //for mode sense/select 6
+    #define LONG_LBA_BLOCK_DESCRIPTOR_LEN  UINT8_C(16) //for mode sense/select 10
 
-    #define LOG_PAGE_HEADER_LENGTH 4
+    #define LOG_PAGE_HEADER_LENGTH UINT8_C(4)
 
-    #define READ_CAPACITY_10_LEN 8
-    #define READ_CAPACITY_16_LEN 32
+    #define READ_CAPACITY_10_LEN UINT8_C(8)
+    #define READ_CAPACITY_16_LEN UINT8_C(32)
+
+    typedef enum _eSCSIPeripheralQualifier
+    {
+        PERIPHERAL_QUALIFIER_ACCESSIBLE_TO_TASK_ROUTER                  = 0x00,
+        PERIPHERAL_QUALIFIER_NOT_ACCESSIBLE_TO_TASK_ROUTER_BUT_CAPABLE  = 0x01,
+        PERIPHERAL_QUALIFIER_RESERVED_2                                 = 0x02,
+        PERIPHERAL_QUALIFIER_NOT_ACCESSIBLE_TO_TASK_ROUTER              = 0x03,
+        PERIPHERAL_QUALIFIER_RESERVED_4                                 = 0x04,
+        PERIPHERAL_QUALIFIER_RESERVED_5                                 = 0x05,
+        PERIPHERAL_QUALIFIER_RESERVED_6                                 = 0x06,
+        PERIPHERAL_QUALIFIER_RESERVED_7                                 = 0x07
+    }eSCSIPeripheralQualifier;
 
     typedef enum _eSCSIPeripheralDeviceType
     {
@@ -866,6 +911,7 @@ extern "C"
         STANDARD_CODE_SPL2 = 262,
         STANDARD_CODE_SPL3 = 263,
         STANDARD_CODE_SPL4 = 264,
+        STANDARD_CODE_SPL5 = 265,
         //271 - 290 SCSI over PCI Extress Transport Protocols
         STANDARD_CODE_SOP = 271,
         STANDARD_CODE_PQI = 272,
@@ -923,6 +969,29 @@ extern "C"
         SCSI_PROTOCOL_ID_RESERVED3      = 0xE,
         SCSI_PROTOCOL_ID_NO_SPECIFIC_PROTOCOL   = 0xF
     }eSCSIProtocolID;
+
+    #define REPORT_LUNS_MIN_LENGTH UINT16_C(16)  //this is the minimum length from SPC, but this requirement was removed later -TJE
+
+    OPENSEA_TRANSPORT_API bool is_LaCie_USB_Vendor_ID(const char* t10VendorIdent);
+    OPENSEA_TRANSPORT_API bool is_Seagate_USB_Vendor_ID(const char* t10VendorIdent);
+    OPENSEA_TRANSPORT_API bool is_Seagate_SAS_Vendor_ID(const char* t10VendorIdent);
+    OPENSEA_TRANSPORT_API void seagate_Serial_Number_Cleanup(const char* t10VendorIdent, char** unitSerialNumber, size_t unitSNSize);
+
+    //SCSI Architecture model status's
+    typedef enum _eSAMStatus
+    {
+        SAM_STATUS_GOOD                         = 0x00,
+        SAM_STATUS_CHECK_CONDITION              = 0x02,
+        SAM_STATUS_CONDITION_MET                = 0x03,
+        SAM_STATUS_BUSY                         = 0x04,
+        SAM_STATUS_INTERMEDIATE                 = 0x10,
+        SAM_STATUS_INTERMEDIATE_CONDITION_MET   = 0x14,
+        SAM_STATUS_RESERVATION_CONFLICT         = 0x18,
+        SAM_STATUS_COMMAND_TERMINATED           = 0x22,
+        SAM_STATUS_TASK_SET_FULL                = 0x28,
+        SAM_STATUS_ACA_ACTIVE                   = 0x30,
+        SAM_STATUS_TASK_ABORTED                 = 0x40,
+    }eSAMStatus;
 
 
     #if defined (__cplusplus)

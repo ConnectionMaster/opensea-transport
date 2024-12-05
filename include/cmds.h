@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -38,7 +39,7 @@ extern "C"
     //!   \return SUCCESS = pass, FAILURE = fail
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int send_Sanitize_Block_Erase(tDevice *device, bool exitFailureMode, bool znr);
+    OPENSEA_TRANSPORT_API eReturnValues send_Sanitize_Block_Erase(tDevice *device, bool exitFailureMode, bool znr);
 
     //-----------------------------------------------------------------------------
     //
@@ -55,7 +56,7 @@ extern "C"
     //!   \return SUCCESS = pass, FAILURE = fail
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int send_Sanitize_Crypto_Erase(tDevice *device, bool exitFailureMode, bool znr);
+    OPENSEA_TRANSPORT_API eReturnValues send_Sanitize_Crypto_Erase(tDevice *device, bool exitFailureMode, bool znr);
 
     //-----------------------------------------------------------------------------
     //
@@ -68,15 +69,15 @@ extern "C"
     //!   \param[in] exitFailureMode = set the failure mode bit to 1. See ACS3 or SBC4 for details on what this does
     //!   \param[in] invertBetweenPasses = set the bit to invert the pattern between passes
     //!   \param[in] overwritePasses = this is the number of passes to run. a value of 0 means 16 passes (which is the max for sanitize). (For SCSI, we adjust this to set 16 since a value of 0 is reserved)
-    //!   \param[in] pattern = pointer to a buffer containing a pattern. (Set to NULL to use zeros)
-    //!   \param[in] patternLength = the length of the patter. Max length on SCSI is 1 logical sector. On ATA, the length MUST BE 4! Only required if pattern is non-NULL.
+    //!   \param[in] pattern = pointer to a buffer containing a pattern. (Set to M_NULLPTR to use zeros)
+    //!   \param[in] patternLength = the length of the patter. Max length on SCSI is 1 logical sector. On ATA, the length MUST BE 4! Only required if pattern is non-M_NULLPTR.
     //!   \param[in] znr - zone no reset bit. This is used on host managed and host aware drives to not reset the zone pointers during a sanitize.
     //!
     //  Exit:
     //!   \return SUCCESS = pass, FAILURE = fail
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int send_Sanitize_Overwrite_Erase(tDevice *device, bool exitFailureMode, bool invertBetweenPasses, uint8_t overwritePasses, uint8_t *pattern, uint16_t patternLength, bool znr);
+    OPENSEA_TRANSPORT_API eReturnValues send_Sanitize_Overwrite_Erase(tDevice *device, bool exitFailureMode, bool invertBetweenPasses, uint8_t overwritePasses, uint8_t *pattern, uint16_t patternLength, bool znr);
 
     //-----------------------------------------------------------------------------
     //
@@ -91,7 +92,7 @@ extern "C"
     //!   \return SUCCESS = pass, FAILURE = fail
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int send_Sanitize_Exit_Failure_Mode(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues send_Sanitize_Exit_Failure_Mode(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -107,7 +108,7 @@ extern "C"
     //!   \return SUCCESS = good, !SUCCESS something went wrong see error codes
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int spin_down_drive(tDevice *device, bool sleepState);
+    OPENSEA_TRANSPORT_API eReturnValues spin_down_drive(tDevice *device, bool sleepState);
 
     //-----------------------------------------------------------------------------
     //
@@ -124,7 +125,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int fill_Drive_Info_Data(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues fill_Drive_Info_Data(tDevice *device);
 
     typedef enum _eDownloadMode
     {
@@ -153,12 +154,15 @@ extern "C"
     //!   \param firstSegment - first segment of a firmware download. Helps low-level OS ioctls (Mostly Windows based)
     //!   \param lastSegment - last segment of a firmware download. Helps low-level OS ioctls (Mostly Windows based)
     //!   \param timeoutSeconds - timeout for the command. Selectable since some updates may be slower than others.
+    //!   \param nvmeForceCA - force a specific commit action for NVMe firmware commit commands
+    //!   \param commitAction - the forced action. nvmeForceCA must be set to true, otherwise this is ignored.
+    //!   \param forceDisableReset - if this is set to true, it overrides any automatic reset after an NVMe firmware commit. When false, it lets this function decide when to issue a reset.
     //!   
     //  Exit:
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int firmware_Download_Command(tDevice *device, eDownloadMode dlMode, uint32_t offset, uint32_t xferLen, uint8_t *ptrData, uint8_t slotNumber, bool existingImage, bool firstSegment, bool lastSegment, uint32_t timeoutSeconds);
+    OPENSEA_TRANSPORT_API eReturnValues firmware_Download_Command(tDevice *device, eDownloadMode dlMode, uint32_t offset, uint32_t xferLen, uint8_t *ptrData, uint8_t slotNumber, bool existingImage, bool firstSegment, bool lastSegment, uint32_t timeoutSeconds, bool nvmeForceCA, uint8_t commitAction, bool forceDisableReset);
 
     //-----------------------------------------------------------------------------
     //
@@ -170,12 +174,15 @@ extern "C"
     //!   \param slotNumber - set to the slot number (NVMe) or buffer ID (SCSI) that you want to set. If unsure, set this to zero. Ignored on ATA drives.
     //!   \param existingImage - set to true if using this command to activate an existing image in the specified slot, false if it is a new image to activate.
     //!   \param timeoutSeconds - timeout for the command. Selectable since some updates may be slower than others.
+    //!   \param nvmeForceCA - force a specific commit action for NVMe firmware commit commands
+    //!   \param commitAction - the forced action. nvmeForceCA must be set to true, otherwise this is ignored.
+    //!   \param forceDisableReset - if this is set to true, it overrides any automatic reset after an NVMe firmware commit. When false, it lets this function decide when to issue a reset.
     //!   
     //  Exit:
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int firmware_Download_Activate(tDevice *device, uint8_t slotNumber, bool existingImage, uint32_t timeoutSeconds);
+    OPENSEA_TRANSPORT_API eReturnValues firmware_Download_Activate(tDevice *device, uint8_t slotNumber, bool existingImage, uint32_t timeoutSeconds, bool nvmeForceCA, uint8_t commitAction, bool forceDisableReset);
 
     typedef enum _eSecurityProtocols
     {
@@ -221,7 +228,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int security_Send(tDevice *device, uint8_t securityProtocol, uint16_t securityProtocolSpecific, uint8_t *ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues security_Send(tDevice *device, uint8_t securityProtocol, uint16_t securityProtocolSpecific, uint8_t *ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -239,26 +246,26 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int security_Receive(tDevice *device, uint8_t securityProtocol, uint16_t securityProtocolSpecific, uint8_t *ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues security_Receive(tDevice *device, uint8_t securityProtocol, uint16_t securityProtocolSpecific, uint8_t *ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
     //  write_Same()
     //
     //! \brief   Description:  This function will send a write same command to a drive. For scsi drives, writesame16 is used, on ata drives, SCT write same is used. 
-    //!          If pattern is NULL, a zero pattern is used (SCSI sets the nodataout bit, which may not be supported on the drive, so sending a buffer is recommended).
+    //!          If pattern is M_NULLPTR, a zero pattern is used (SCSI sets the nodataout bit, which may not be supported on the drive, so sending a buffer is recommended).
     //!          If pattern is non-null, the buffer it points to MUST be 1 logical sector in size.
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param startingLba - lba to start the write same at
     //!   \param numberOfLogicalBlocks - The number of logical blocks to write to from the startingLba (range). SCSI Has a max range of a UINT32, ATA has max of UINT64
-    //!   \param pattern - pointer to a buffer that is 1 logical sector in size and contains a pattern to write. If this is NULL, a zero pattern will be used in place.
+    //!   \param pattern - pointer to a buffer that is 1 logical sector in size and contains a pattern to write. If this is M_NULLPTR, a zero pattern will be used in place.
     //!   
     //  Exit:
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int write_Same(tDevice *device, uint64_t startingLba, uint64_t numberOfLogicalBlocks, uint8_t *pattern);
+    OPENSEA_TRANSPORT_API eReturnValues write_Same(tDevice *device, uint64_t startingLba, uint64_t numberOfLogicalBlocks, uint8_t *pattern);
 
 
     OPENSEA_TRANSPORT_API bool is_Write_Psuedo_Uncorrectable_Supported(tDevice *device);
@@ -275,7 +282,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int write_Psuedo_Uncorrectable_Error(tDevice *device, uint64_t corruptLBA);
+    OPENSEA_TRANSPORT_API eReturnValues write_Psuedo_Uncorrectable_Error(tDevice *device, uint64_t corruptLBA);
 
     OPENSEA_TRANSPORT_API bool is_Write_Flagged_Uncorrectable_Supported(tDevice *device);
     //-----------------------------------------------------------------------------
@@ -291,7 +298,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int write_Flagged_Uncorrectable_Error(tDevice *device, uint64_t corruptLBA);
+    OPENSEA_TRANSPORT_API eReturnValues write_Flagged_Uncorrectable_Error(tDevice *device, uint64_t corruptLBA);
 
     //-----------------------------------------------------------------------------
     //
@@ -301,7 +308,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start reading at
-    //!   \param async - set to true for an asynchronous read command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send read verify AND read in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to fill in with read data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be read. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -309,7 +316,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int read_LBA(tDevice *device, uint64_t lba, bool async, uint8_t* ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues read_LBA(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t* ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -319,7 +326,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start writing at
-    //!   \param async - set to true for an asynchronous write command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send write AND read verify in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to use for writing data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be written. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -327,7 +334,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int write_LBA(tDevice *device, uint64_t lba, bool async, uint8_t* ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues write_LBA(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t* ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -343,7 +350,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int verify_LBA(tDevice *device, uint64_t lba, uint32_t range);
+    OPENSEA_TRANSPORT_API eReturnValues verify_LBA(tDevice *device, uint64_t lba, uint32_t range);
 
     //-----------------------------------------------------------------------------
     //
@@ -357,7 +364,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int flush_Cache(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues flush_Cache(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -367,7 +374,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start reading at
-    //!   \param async - set to true for an asynchronous read command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send read verify AND read in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to fill in with read data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be read. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -375,7 +382,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int os_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues os_Read(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t *ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -385,7 +392,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start writing at
-    //!   \param async - set to true for an asynchronous write command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send write AND read verify in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to use for writing data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be written. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -393,11 +400,11 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int os_Write(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues os_Write(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t *ptrData, uint32_t dataSize);
 
-    OPENSEA_TRANSPORT_API int os_Verify(tDevice *device, uint64_t lba, uint32_t range);
+    OPENSEA_TRANSPORT_API eReturnValues os_Verify(tDevice *device, uint64_t lba, uint32_t range);
 
-    OPENSEA_TRANSPORT_API int os_Flush(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues os_Flush(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -407,7 +414,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start reading at
-    //!   \param async - set to true for an asynchronous read command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send read verify AND read in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to fill in with read data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be read. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -415,7 +422,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int io_Read(tDevice *device, uint64_t lba, bool async, uint8_t* ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues io_Read(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t* ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -425,7 +432,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start writing at
-    //!   \param async - set to true for an asynchronous write command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send write AND read verify in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to use for writing data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be written. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -433,7 +440,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int io_Write(tDevice *device, uint64_t lba, bool async, uint8_t* ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues io_Write(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t* ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -443,7 +450,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start writing at
-    //!   \param async - set to true for an asynchronous write command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send write AND read verify in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to use for writing data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be written. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -451,7 +458,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int scsi_Write(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues scsi_Write(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t *ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -461,7 +468,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start reading at
-    //!   \param async - set to true for an asynchronous read command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send read verify AND read in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to use for reading data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be read. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -469,7 +476,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int scsi_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues scsi_Read(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t *ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -479,7 +486,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start writing at
-    //!   \param async - set to true for an asynchronous write command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send write AND read verify in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to use for writing data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be written. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -487,7 +494,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int ata_Write(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues ata_Write(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t *ptrData, uint32_t dataSize);
 
     //-----------------------------------------------------------------------------
     //
@@ -497,7 +504,7 @@ extern "C"
     //  Entry:
     //!   \param device - pointer to the device structure
     //!   \param lba - the LBA you wish to start reading at
-    //!   \param async - set to true for an asynchronous read command (NOT SUPPORTED at this time)
+    //!   \param forceUnitAccess - set to true to bypass the cache and go directly to media (NOTE: May send read verify AND read in some cases if FUA bit not supported in a command)
     //!   \param ptrData - pointer to the data buf to use for reading data
     //!   \param dataSize - size of the buffer, in bytes, for what is to be read. This size is divided by the device's logical sector size to get how many sectors to transfer.
     //!   
@@ -505,26 +512,28 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int ata_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues ata_Read(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t *ptrData, uint32_t dataSize);
 
-    OPENSEA_TRANSPORT_API int scsi_Verify(tDevice *device, uint64_t lba, uint32_t range);
+    OPENSEA_TRANSPORT_API eReturnValues scsi_Verify(tDevice *device, uint64_t lba, uint32_t range);
 
-    OPENSEA_TRANSPORT_API int ata_Read_Verify(tDevice *device, uint64_t lba, uint32_t range);
+    OPENSEA_TRANSPORT_API eReturnValues nvme_Verify_LBA(tDevice *device, uint64_t lba, uint32_t range);
 
-    OPENSEA_TRANSPORT_API int ata_Flush_Cache_Command(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues ata_Read_Verify(tDevice *device, uint64_t lba, uint32_t range);
 
-    OPENSEA_TRANSPORT_API int scsi_Synchronize_Cache_Command(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues ata_Flush_Cache_Command(tDevice *device);
 
-    OPENSEA_TRANSPORT_API int close_Zone(tDevice *device, bool closeAll, uint64_t zoneID);
+    OPENSEA_TRANSPORT_API eReturnValues scsi_Synchronize_Cache_Command(tDevice *device);
 
-    OPENSEA_TRANSPORT_API int finish_Zone(tDevice *device, bool finishAll, uint64_t zoneID);
+    OPENSEA_TRANSPORT_API eReturnValues close_Zone(tDevice *device, bool closeAll, uint64_t zoneID, uint16_t zoneCount);
 
-    OPENSEA_TRANSPORT_API int open_Zone(tDevice *device, bool openAll, uint64_t zoneID);
+    OPENSEA_TRANSPORT_API eReturnValues finish_Zone(tDevice *device, bool finishAll, uint64_t zoneID, uint16_t zoneCount);
 
-    OPENSEA_TRANSPORT_API int reset_Write_Pointer(tDevice *device, bool resetAll, uint64_t zoneID);
+    OPENSEA_TRANSPORT_API eReturnValues open_Zone(tDevice *device, bool openAll, uint64_t zoneID, uint16_t zoneCount);
 
-    OPENSEA_TRANSPORT_API int report_Zones(tDevice *device, eZoneReportingOptions reportingOptions, bool partial, uint64_t zoneLocator, uint8_t *ptrData, uint32_t dataSize);
+    OPENSEA_TRANSPORT_API eReturnValues reset_Write_Pointer(tDevice *device, bool resetAll, uint64_t zoneID, uint16_t zoneCount);
 
-    #if defined (__cplusplus)
+    OPENSEA_TRANSPORT_API eReturnValues report_Zones(tDevice *device, eZoneReportingOptions reportingOptions, bool partial, uint64_t zoneLocator, uint8_t *ptrData, uint32_t dataSize);
+
+#if defined (__cplusplus)
 }
-    #endif
+#endif

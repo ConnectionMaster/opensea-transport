@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -9,6 +10,20 @@
 //
 // ******************************************************************************************
 //
+
+#include "common_types.h"
+#include "precision_timer.h"
+#include "memory_safety.h"
+#include "type_conversion.h"
+#include "string_utils.h"
+#include "bit_manip.h"
+#include "code_attributes.h"
+#include "math_utils.h"
+#include "error_translation.h"
+#include "windows_version_detect.h"
+#include "sleep.h"
+#include "io_utils.h"
+
 #include <stdio.h>
 #include <stdlib.h> // for mbstowcs_s
 #include <stddef.h> // offsetof
@@ -21,16 +36,14 @@
 #include <windows.h>                // added for forced PnP rescan
 #include <tchar.h>
 #include <initguid.h>
-//#if !defined(DISABLE_NVME_PASSTHROUGH)
 #include <ntddstor.h>
-//#endif
 //NOTE: ARM requires 10.0.16299.0 API to get this library!
 #include <cfgmgr32.h>               // added for forced PnP rescan
 //#include <setupapi.h> //NOTE: Not available for ARM
 #include <devpropdef.h>
 #include <devpkey.h>
 #include <winbase.h>
-#include "common.h"
+
 #include "scsi_helper_func.h"
 #include "ata_helper_func.h"
 #include "win_helper.h"
@@ -38,10 +51,8 @@
 #include "usb_hacks.h"
 #include "common_public.h"
 
-#if !defined(DISABLE_NVME_PASSTHROUGH)
 #include "nvme_helper.h"
 #include "nvme_helper_func.h"
-#endif
 
 #if defined (ENABLE_CSMI) //when this is enabled, the "get_Device", "get_Device_Count", and "get_Device_List" will also check for CSMI devices unless a flag is given to ignore them. For apps only doing CSMI, call the csmi implementations directly
 #include "csmi_helper_func.h"
@@ -57,6 +68,10 @@
 
 #include "raid_scan_helper.h"
 
+#if defined (_DEBUG) && !defined (WIN_DEBUG)
+#define WIN_DEBUG
+#endif //_DEBUG && !WIN_DEBUG
+
 //If this returns true, a timeout can be sent with INFINITE_TIMEOUT_VALUE definition and it will be issued, otherwise you must try MAX_CMD_TIMEOUT_SECONDS instead
 bool os_Is_Infinite_Timeout_Supported(void)
 {
@@ -64,7 +79,7 @@ bool os_Is_Infinite_Timeout_Supported(void)
 }
 
 //MinGW may or may not have some of these, so there is a need to define these here to build properly when they are otherwise not available.
-//TODO: as mingw changes versions, some of these below may be available. Need to have a way to check mingw preprocessor defines for versions to work around these.
+//as mingw changes versions, some of these below may be available. Need to have a way to check mingw preprocessor defines for versions to work around these.
 //NOTE: The device property keys are incomplete in mingw. Need to add similar code using setupapi and some sort of ifdef to switch between for VS and mingw to resolve this better.
 #if defined (__MINGW32__) || defined (__MINGW64__)
     #if !defined (ATA_FLAGS_NO_MULTIPLE)
@@ -78,11 +93,11 @@ bool os_Is_Infinite_Timeout_Supported(void)
     #endif
 
     //This is for looking up hardware IDs of devices for PCIe/USB, etc
-    #if !defined (DEVPKEY_Device_HardwareIds)
-        DEFINE_DEVPROPKEY(DEVPKEY_Device_HardwareIds,            0xa45c254e, 0xdf1c, 0x4efd, 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0, 3); 
+    #if defined (NEED_DEVHARDID)
+        DEFINE_DEVPROPKEY(DEVPKEY_Device_HardwareIds, 0xa45c254e, 0xdf1c, 0x4efd, 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0, 3); 
     #endif
 
-    #if !defined (DEVPKEY_Device_CompatibleIds)
+    #if defined (NEED_DEVCOMPID)
         DEFINE_DEVPROPKEY(DEVPKEY_Device_CompatibleIds, 0xa45c254e, 0xdf1c, 0x4efd, 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0, 4);
     #endif
 
@@ -118,20 +133,20 @@ bool os_Is_Infinite_Timeout_Supported(void)
 
 extern bool validate_Device_Struct(versionBlock);
 
-int get_Windows_SMART_IO_Support(tDevice *device);
+eReturnValues get_Windows_SMART_IO_Support(tDevice *device);
 #if WINVER >= SEA_WIN32_WINNT_WIN10
-int get_Windows_FWDL_IO_Support(tDevice *device, STORAGE_BUS_TYPE busType);
-bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx *scsiIoCtx);//TODO: add nvme support...may not need an NVMe version since it's the only way to update code on NVMe
-int send_Win_ATA_Get_Log_Page_Cmd(ScsiIoCtx *scsiIoCtx);
-int send_Win_ATA_Identify_Cmd(ScsiIoCtx *scsiIoCtx);
+eReturnValues get_Windows_FWDL_IO_Support(tDevice *device, STORAGE_BUS_TYPE busType);
+bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx *scsiIoCtx);
+eReturnValues send_Win_ATA_Get_Log_Page_Cmd(ScsiIoCtx *scsiIoCtx);
+eReturnValues send_Win_ATA_Identify_Cmd(ScsiIoCtx *scsiIoCtx);
 #endif
-#if defined (_DEBUG)
+#if defined (WIN_DEBUG)
 // \fn print_bus_type (BYTE type)
 // \nbrief Funtion to print in human readable format the BusType of a device
 // \param BYTE which is STORAGE_BUS_TYPE windows enum
-static void print_bus_type( BYTE type );
+static void print_bus_type(BYTE type);
 
-void print_bus_type( BYTE type )
+void print_bus_type(BYTE type)
 {
     switch (type)
     {
@@ -213,51 +228,210 @@ void print_bus_type( BYTE type )
         break;
     }
 }
-#endif
+#endif //WIN_DEBUG
 
 //This function is only used in get_Adapter_IDs which is why it's here. If this is useful for something else in the future, move it to opensea-common.
-static void convert_String_Spaces_To_Underscores(char *stringToChange)
+//static void convert_String_Spaces_To_Underscores(char *stringToChange)
+//{
+//    size_t stringLen = 0, iter = 0;
+//    if (stringToChange == M_NULLPTR)
+//    {
+//        return;
+//    }
+//    stringLen = safe_strlen(stringToChange);
+//    if (stringLen == 0)
+//    {
+//        return;
+//    }
+//    while (iter <= stringLen)
+//    {
+//        if (safe_isspace(stringToChange[iter]))
+//        {
+//            stringToChange[iter] = '_';
+//        }
+//        iter++;
+//    }
+//}
+
+static bool get_IDs_From_TCHAR_String(DEVINST instance, TCHAR* buffer, size_t bufferLength, tDevice* device)
 {
-    size_t stringLen = 0, iter = 0;
-    if (stringToChange == NULL)
+    bool success = true;
+    CONFIGRET cmRet = CR_SUCCESS;
+    //here is where we need to parse the USB VID/PID or TODO: PCI Vendor, Product, and Revision numbers
+    if (_tcsncmp(TEXT("USB"), buffer, _tcsclen(TEXT("USB"))) == 0)
     {
-        return;
-    }
-    stringLen = strlen(stringToChange);
-    if (stringLen == 0)
-    {
-        return;
-    }
-    while (iter <= stringLen)
-    {
-        if (isspace(stringToChange[iter]))
+        ULONG propertyBufLen = 0;
+        DEVPROPTYPE propertyType = 0;
+#if defined (_MSC_VER) && _MSC_VER < SEA_MSC_VER_VS2015
+        //This is a hack around how VS2013 handles string concatenation with how the printf format macros were defined for it versus newer versions.
+        int scannedVals = _sntscanf_s(buffer, bufferLength, TEXT("USB\\VID_%x&PID_%x\\%*s"), &device->drive_info.adapter_info.vendorID, &device->drive_info.adapter_info.productID);
+#else
+        int scannedVals = _sntscanf_s(buffer, bufferLength, TEXT("USB\\VID_%") TEXT(SCNx32) TEXT("&PID_%") TEXT(SCNx32) TEXT("\\%*s"), &device->drive_info.adapter_info.vendorID, &device->drive_info.adapter_info.productID);
+#endif
+        device->drive_info.adapter_info.vendorIDValid = true;
+        device->drive_info.adapter_info.productIDValid = true;
+        if (scannedVals < 2)
         {
-            stringToChange[iter] = '_';
+#if defined (_DEBUG)
+            printf("Could not scan all values. Scanned %d values\n", scannedVals);
+#endif
         }
-        iter++;
+        device->drive_info.adapter_info.infoType = ADAPTER_INFO_USB;
+        //unfortunately, this device ID doesn't have a revision in it for USB.
+        //We can do this other property request to read it, but it's wide characters only. No TCHARs allowed.
+        cmRet = CM_Get_DevNode_PropertyW(instance, &DEVPKEY_Device_HardwareIds, &propertyType, M_NULLPTR, &propertyBufLen, 0);
+        if (CR_SUCCESS == cmRet || CR_INVALID_POINTER == cmRet || CR_BUFFER_SMALL == cmRet)//We'll probably get an invalid pointer or small buffer, but this will return the size of the buffer we need, so allow it through - TJE
+        {
+            PBYTE propertyBuf = C_CAST(PBYTE, safe_calloc(propertyBufLen + 1, sizeof(BYTE)));
+            if (propertyBuf)
+            {
+                propertyBufLen += 1;
+                //NOTE: This key contains all 3 parts, VID, PID, and REV from the "parentInst": Example: USB\VID_174C&PID_2362&REV_0100
+                if (CR_SUCCESS == CM_Get_DevNode_PropertyW(instance, &DEVPKEY_Device_HardwareIds, &propertyType, propertyBuf, &propertyBufLen, 0))
+                {
+                    //multiple strings can be returned.
+                    for (LPWSTR property = C_CAST(LPWSTR, propertyBuf); *property; property += wcslen(property) + 1)
+                    {
+                        if (property && (C_CAST(uintptr_t, property) - C_CAST(uintptr_t, propertyBuf)) < propertyBufLen && wcslen(property))
+                        {
+                            LPWSTR revisionStr = wcsstr(property, L"REV_");
+                            if (revisionStr)
+                            {
+                                if (1 == swscanf(revisionStr, L"REV_%x", &device->drive_info.adapter_info.revision))
+                                {
+                                    device->drive_info.adapter_info.revisionValid = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                safe_free(&propertyBuf);
+            }
+        }
     }
+    else if (_tcsncmp(TEXT("PCI"), buffer, _tcsclen(TEXT("PCI"))) == 0)
+    {
+        uint32_t subsystem = 0;
+        uint32_t revision = 0;
+#if defined (_MSC_VER) && _MSC_VER  < SEA_MSC_VER_VS2015
+        //This is a hack around how VS2013 handles string concatenation with how the printf format macros were defined for it versus newer versions.
+        int scannedVals = _sntscanf_s(buffer, bufferLength, TEXT("PCI\\VEN_%lx&DEV_%lx&SUBSYS_%lx&REV_%lx\\%*s"), &device->drive_info.adapter_info.vendorID, &device->drive_info.adapter_info.productID, &subsystem, &revision);
+#else
+        int scannedVals = _sntscanf_s(buffer, bufferLength, TEXT("PCI\\VEN_%") TEXT(SCNx32) TEXT("&DEV_%") TEXT(SCNx32) TEXT("&SUBSYS_%") TEXT(SCNx32) TEXT("&REV_%") TEXT(SCNx32) TEXT("\\%*s"), &device->drive_info.adapter_info.vendorID, &device->drive_info.adapter_info.productID, &subsystem, &revision);
+#endif
+        device->drive_info.adapter_info.vendorIDValid = true;
+        device->drive_info.adapter_info.productIDValid = true;
+        device->drive_info.adapter_info.revision = revision;
+        device->drive_info.adapter_info.revisionValid = true;
+        device->drive_info.adapter_info.infoType = ADAPTER_INFO_PCI;
+        if (scannedVals < 4)
+        {
+#if defined (_DEBUG)
+            printf("Could not scan all values. Scanned %d values\n", scannedVals);
+#endif
+        }
+        //can also read DEVPKEY_Device_HardwareIds for parentInst to get all this data
+    }
+    else if (_tcsncmp(TEXT("1394"), buffer, _tcsclen(TEXT("1394"))) == 0)
+    {
+        //Parent buffer already contains the vendor ID as part of the buffer where a full WWN is reported...we just need first 6 bytes. example, brackets added for clarity: 1394\Maxtor&5000DV__v1.00.00\[0010B9]20003D9D6E
+        //DEVPKEY_Device_CompatibleIds gets use 1394 specifier ID for the device instance
+        //DEVPKEY_Device_CompatibleIds gets revision and specifier ID for the parent instance: 1394\<specifier>&<revision>
+        //DEVPKEY_Device_ConfigurationId gets revision and specifier ID for parent instance: sbp2.inf:1394\609E&10483,sbp2_install
+        //NOTE: There is no currently known way to get the product ID for this interface
+        ULONG propertyBufLen = 0;
+        DEVPROPTYPE propertyType = 0;
+        const DEVPROPKEY* propertyKey = &DEVPKEY_Device_CompatibleIds;
+        //scan buffer to get vendor
+        TCHAR* nextToken = M_NULLPTR;
+        TCHAR* token = _tcstok_s(buffer, TEXT("\\"), &nextToken);
+        while (token && nextToken && _tcsclen(nextToken) > 0)
+        {
+            token = _tcstok_s(M_NULLPTR, TEXT("\\"), &nextToken);
+        }
+        if (token)
+        {
+            //at this point, the token contains only the part we care about reading
+            //We need the first 6 characters to convert into hex for the vendor ID
+            DECLARE_ZERO_INIT_ARRAY(TCHAR, vendorIDString, 7);
+            _tcsncpy_s(vendorIDString, 7, token, 6);
+            _tprintf(TEXT("%s\n"), vendorIDString);
+#if defined (_MSC_VER) && _MSC_VER  < SEA_MSC_VER_VS2015
+            //This is a hack around how VS2013 handles string concatenation with how the printf format macros were defined for it versus newer versions.
+            int result = _stscanf(token, TEXT("%06lx"), &device->drive_info.adapter_info.vendorID);
+#else
+            int result = _stscanf(token, TEXT("%06") TEXT(SCNx32), &device->drive_info.adapter_info.vendorID);
+#endif
+
+            if (result == 1)
+            {
+                device->drive_info.adapter_info.vendorIDValid = true;
+            }
+        }
+
+        device->drive_info.adapter_info.infoType = ADAPTER_INFO_IEEE1394;
+        cmRet = CM_Get_DevNode_PropertyW(instance, propertyKey, &propertyType, M_NULLPTR, &propertyBufLen, 0);
+        if (CR_SUCCESS == cmRet || CR_INVALID_POINTER == cmRet || CR_BUFFER_SMALL == cmRet)//We'll probably get an invalid pointer or small buffer, but this will return the size of the buffer we need, so allow it through - TJE
+        {
+            PBYTE propertyBuf = C_CAST(PBYTE, safe_calloc(propertyBufLen + 1, sizeof(BYTE)));
+            if (propertyBuf)
+            {
+                propertyBufLen += 1;
+                if (CR_SUCCESS == CM_Get_DevNode_PropertyW(instance, propertyKey, &propertyType, propertyBuf, &propertyBufLen, 0))
+                {
+                    //multiple strings can be returned for some properties. This one will most likely only return one.
+                    for (LPWSTR property = C_CAST(LPWSTR, propertyBuf); *property; property += wcslen(property) + 1)
+                    {
+                        if (property && (C_CAST(uintptr_t, property) - C_CAST(uintptr_t, propertyBuf)) < propertyBufLen && wcslen(property))
+                        {
+                            int scannedVals = _snwscanf_s(C_CAST(const wchar_t*, propertyBuf), propertyBufLen, L"1394\\%x&%x", &device->drive_info.adapter_info.specifierID, &device->drive_info.adapter_info.revision);
+                            if (scannedVals < 2)
+                            {
+#if defined (_DEBUG)
+                                printf("Could not scan all values. Scanned %d values\n", scannedVals);
+#endif
+                            }
+                            else
+                            {
+                                device->drive_info.adapter_info.specifierIDValid = true;
+                                device->drive_info.adapter_info.revisionValid = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                safe_free(&propertyBuf);
+            }
+        }
+    }
+    else
+    {
+        success = false;
+    }
+    return success;
 }
 
 //This function uses cfgmgr32 for figuring out the adapter information. 
 //It is possible to do this with setupapi as well. cfgmgr32 is supposedly available in some form for universal apps, whereas setupapi is not.
-static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDescriptor, ULONG deviceDescriptorLength)
+static eReturnValues get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDescriptor, ULONG deviceDescriptorLength)
 {
-    int ret = BAD_PARAMETER;
+    eReturnValues ret = BAD_PARAMETER;
     if (deviceDescriptor && deviceDescriptorLength > sizeof(STORAGE_DEVICE_DESCRIPTOR))//make sure we have a device descriptor bigger than the header so we can access the raw data
     {
         //First, get the list of disk device IDs, then locate a matching one...then find the parent and parse the IDs out.
-        TCHAR *listBuffer = NULL;
+        TCHAR *listBuffer = M_NULLPTR;
         ULONG deviceIdListLen = 0;
         CONFIGRET cmRet = CR_SUCCESS;
 #if WINVER > SEA_WIN32_WINNT_VISTA
-        TCHAR *filter = TEXT("{4d36e967-e325-11ce-bfc1-08002be10318}");
+        const TCHAR *filter = TEXT("{4d36e967-e325-11ce-bfc1-08002be10318}");
         ULONG deviceIdListFlags = CM_GETIDLIST_FILTER_PRESENT | CM_GETIDLIST_FILTER_CLASS;//Both of these flags require Windows 7 and later. The else case below will handle older OSs
         cmRet = CM_Get_Device_ID_List_Size(&deviceIdListLen, filter, deviceIdListFlags);
         if (cmRet == CR_SUCCESS)
         {
             if (deviceIdListLen > 0)
             {
-                listBuffer = C_CAST(TCHAR*, calloc(deviceIdListLen, sizeof(TCHAR)));
+                listBuffer = C_CAST(TCHAR*, safe_calloc(deviceIdListLen, sizeof(TCHAR)));
                 if (listBuffer)
                 {
                     cmRet = CM_Get_Device_ID_List(filter, listBuffer, deviceIdListLen, deviceIdListFlags);
@@ -270,24 +444,28 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
         }
         else if (cmRet == CR_INVALID_FLAG)
 #else 
-        if(cmRet == CR_SUCCESS)
+        if (cmRet == CR_SUCCESS)
 #endif //WINVER > SEA_WIN32_WINNT_VISTA
         {
             //older OS? Try the legacy method which should work for Win2000+
             //This requires knowing if we are searching for USB vs SCSI device IDs
             //TODO: We may need to add other things for firewire or other attachment types that existed back in Vista or XP if they aren't handled under USB or SCSI
-            TCHAR *scsiFilter = TEXT("SCSI"), *usbFilter = TEXT("USBSTOR");//Need to use USBSTOR in order to find a match. Using USB returns a list of VID/PID but we don't have a way to match that.
-            ULONG scsiIdListLen = 0, usbIdListLen = 0;
+            const TCHAR *scsiFilter = TEXT("SCSI");
+            const TCHAR *usbFilter = TEXT("USBSTOR");//Need to use USBSTOR in order to find a match. Using USB returns a list of VID/PID but we don't have a way to match that.
+            ULONG scsiIdListLen = 0;
+            ULONG usbIdListLen = 0;
             ULONG filterFlags = CM_GETIDLIST_FILTER_ENUMERATOR;
-            TCHAR *scsiListBuff = NULL, *usbListBuff = NULL;
-            CONFIGRET scsicmRet = CR_SUCCESS, usbcmRet = CR_SUCCESS;
+            TCHAR *scsiListBuff = M_NULLPTR;
+            TCHAR *usbListBuff = M_NULLPTR;
+            CONFIGRET scsicmRet = CR_SUCCESS;
+            CONFIGRET usbcmRet = CR_SUCCESS;
             //First get the SCSI list, then the USB list/ TODO: add more things to the list as we need them.
             scsicmRet = CM_Get_Device_ID_List_Size(&scsiIdListLen, scsiFilter, filterFlags);
             if (scsicmRet == CR_SUCCESS)
             {
                 if (scsiIdListLen > 0)
                 {
-                    scsiListBuff = C_CAST(TCHAR*, calloc(scsiIdListLen, sizeof(TCHAR)));
+                    scsiListBuff = C_CAST(TCHAR*, safe_calloc(scsiIdListLen, sizeof(TCHAR)));
                     if (scsiListBuff)
                     {
                         scsicmRet = CM_Get_Device_ID_List(scsiFilter, scsiListBuff, scsiIdListLen, filterFlags);
@@ -295,7 +473,7 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                     else
                     {
                         ret = MEMORY_FAILURE;
-                    }                    
+                    }
                 }
             }
             usbcmRet = CM_Get_Device_ID_List_Size(&usbIdListLen, usbFilter, filterFlags);
@@ -303,7 +481,7 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
             {
                 if (usbIdListLen > 0)
                 {
-                    usbListBuff = C_CAST(TCHAR*, calloc(usbIdListLen, sizeof(TCHAR)));
+                    usbListBuff = C_CAST(TCHAR*, safe_calloc(usbIdListLen, sizeof(TCHAR)));
                     if (usbListBuff)
                     {
                         usbcmRet = CM_Get_Device_ID_List(usbFilter, usbListBuff, usbIdListLen, filterFlags);
@@ -316,7 +494,7 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
             }
             //now that we got USB and SCSI, we need to merge them together into a common list
             deviceIdListLen = scsiIdListLen + usbIdListLen;
-            listBuffer = C_CAST(TCHAR*, calloc(deviceIdListLen, sizeof(TCHAR)));
+            listBuffer = C_CAST(TCHAR*, safe_calloc(deviceIdListLen, sizeof(TCHAR)));
             if (listBuffer)
             {
                 ULONG copyOffset = 0;
@@ -338,8 +516,8 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
             {
                 ret = MEMORY_FAILURE;
             }
-            safe_Free(scsiListBuff)
-            safe_Free(usbListBuff)
+            safe_free(&scsiListBuff);
+            safe_free(&usbListBuff);
         }
         else
         {
@@ -359,10 +537,10 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
             //loop through the device IDs and see if we find anything that matches.
             for (LPTSTR deviceID = listBuffer; *deviceID && !foundMatch; deviceID += _tcslen(deviceID) + 1)
             {
-                //convert the deviceID to uppercase to make matching easier
-                _tcsupr(deviceID);
                 DEVINST deviceInstance = 0;
                 //if a match is found, call locate devnode. If this is not present, it will fail and we need to continue through the loop
+                //convert the deviceID to uppercase to make matching easier
+                _tcsupr(deviceID);
                 cmRet = CM_Locate_DevNode(&deviceInstance, deviceID, CM_LOCATE_DEVNODE_NORMAL);
                 if (CR_SUCCESS == cmRet)
                 {
@@ -372,8 +550,8 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                     cmRet = CM_Get_Device_Interface_List_Size(&interfaceListSize, &classGUID, deviceID, CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
                     if (CR_SUCCESS == cmRet && interfaceListSize > 0)
                     {
-                        TCHAR *interfaceList = C_CAST(TCHAR*, calloc(interfaceListSize, sizeof(TCHAR)));
-                        if(interfaceList)
+                        TCHAR *interfaceList = C_CAST(TCHAR*, safe_calloc(interfaceListSize, sizeof(TCHAR)));
+                        if (interfaceList)
                         {
                             cmRet = CM_Get_Device_Interface_List(&classGUID, deviceID, interfaceList, interfaceListSize, CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
                             if (CR_SUCCESS == cmRet)
@@ -382,20 +560,21 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                                 for (LPTSTR currentDeviceID = interfaceList; *currentDeviceID && !foundMatch; currentDeviceID += _tcslen(currentDeviceID) + 1)
                                 {
                                     //With this device path, open a handle and get the storage device number. This is a match for the PhysicalDriveX number and we can check that for a match
-                                    HANDLE deviceHandle = CreateFile(currentDeviceID,
+                                    HANDLE deviceHandle = INVALID_HANDLE_VALUE;
+                                    deviceHandle = CreateFile(currentDeviceID,
                                         GENERIC_WRITE | GENERIC_READ,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                        NULL,
+                                        M_NULLPTR,
                                         OPEN_EXISTING,
                                         0,
-                                        NULL);
+                                        M_NULLPTR);
                                     if (deviceHandle && deviceHandle != INVALID_HANDLE_VALUE)
                                     {
                                         //If the storage device number matches, get the parent device instance, then the parent device ID. This will contain the USB VID/PID and PCI Vendor, product, and revision numbers.
                                         STORAGE_DEVICE_NUMBER deviceNumber;
                                         memset(&deviceNumber, 0, sizeof(STORAGE_DEVICE_NUMBER));
                                         DWORD returnedDataSize = 0;
-                                        if (DeviceIoControl(deviceHandle, IOCTL_STORAGE_GET_DEVICE_NUMBER, NULL, 0, &deviceNumber, sizeof(STORAGE_DEVICE_NUMBER), &returnedDataSize, NULL))
+                                        if (DeviceIoControl(deviceHandle, IOCTL_STORAGE_GET_DEVICE_NUMBER, M_NULLPTR, 0, &deviceNumber, sizeof(STORAGE_DEVICE_NUMBER), &returnedDataSize, M_NULLPTR))
                                         {
                                             if (deviceNumber.DeviceNumber == device->os_info.os_drive_number)
                                             {
@@ -410,8 +589,8 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                                                     parentLen += 1;
                                                     if (CR_SUCCESS == cmRet)
                                                     {
-                                                        TCHAR *parentBuffer = C_CAST(TCHAR*, calloc(parentLen, sizeof(TCHAR)));
-                                                        if(parentBuffer)
+                                                        TCHAR *parentBuffer = C_CAST(TCHAR*, safe_calloc(parentLen, sizeof(TCHAR)));
+                                                        if (parentBuffer)
                                                         {
                                                             cmRet = CM_Get_Device_ID(parentInst, parentBuffer, parentLen, 0);
                                                             if (CR_SUCCESS == cmRet)
@@ -423,8 +602,9 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                                                                     DEVPROPTYPE propertyType = 0;
                                                                     DEVINST propInst = deviceInstance;
                                                                     const DEVPROPKEY *devproperty = &DEVPKEY_NAME;
-                                                                    uint16_t counter = 0, instanceCounter = 0;
-                                                                    char *propertyName = NULL;
+                                                                    uint16_t counter = 0;
+                                                                    uint16_t instanceCounter = 0;
+                                                                    char *propertyName = M_NULLPTR;
                                                                     size_t propertyNameLength = 0;
                                                                     //device instance first!
                                                                     while (instanceCounter < 2)
@@ -448,1160 +628,1160 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                                                                             {
                                                                             case 0:
                                                                                 devproperty = &DEVPKEY_Device_DeviceDesc;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DeviceDesc") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DeviceDesc") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DeviceDesc");
                                                                                 break;
                                                                             case 1:
                                                                                 devproperty = &DEVPKEY_Device_HardwareIds;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_HardwareIds") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_HardwareIds") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_HardwareIds");
                                                                                 break;
                                                                             case 2:
                                                                                 devproperty = &DEVPKEY_Device_CompatibleIds;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_CompatibleIds") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_CompatibleIds") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_CompatibleIds");
                                                                                 break;
                                                                             case 3:
                                                                                 devproperty = &DEVPKEY_Device_Service;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Service") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Service") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Service");
                                                                                 break;
                                                                             case 4:
                                                                                 devproperty = &DEVPKEY_Device_Class;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Class") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Class") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Class");
                                                                                 break;
                                                                             case 5:
                                                                                 devproperty = &DEVPKEY_Device_ClassGuid;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ClassGuid") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ClassGuid") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ClassGuid");
                                                                                 break;
                                                                             case 6:
                                                                                 devproperty = &DEVPKEY_Device_Driver;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Driver") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Driver") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Driver");
                                                                                 break;
                                                                             case 7:
                                                                                 devproperty = &DEVPKEY_Device_ConfigFlags;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ConfigFlags") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ConfigFlags") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ConfigFlags");
                                                                                 break;
                                                                             case 8:
                                                                                 devproperty = &DEVPKEY_Device_Manufacturer;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Manufacturer") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Manufacturer") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Manufacturer");
                                                                                 break;
                                                                             case 9:
                                                                                 devproperty = &DEVPKEY_Device_FriendlyName;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_FriendlyName") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_FriendlyName") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_FriendlyName");
                                                                                 break;
                                                                             case 10:
                                                                                 devproperty = &DEVPKEY_Device_LocationInfo;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_LocationInfo") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_LocationInfo") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_LocationInfo");
                                                                                 break;
                                                                             case 11:
                                                                                 devproperty = &DEVPKEY_Device_PDOName;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_PDOName") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_PDOName") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_PDOName");
                                                                                 break;
                                                                             case 12:
                                                                                 devproperty = &DEVPKEY_Device_Capabilities;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Capabilities") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Capabilities") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Capabilities");
                                                                                 break;
                                                                             case 13:
                                                                                 devproperty = &DEVPKEY_Device_UINumber;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_UINumber") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_UINumber") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_UINumber");
                                                                                 break;
                                                                             case 14:
                                                                                 devproperty = &DEVPKEY_Device_UpperFilters;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_UpperFilters") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_UpperFilters") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_UpperFilters");
                                                                                 break;
                                                                             case 15:
                                                                                 devproperty = &DEVPKEY_Device_LowerFilters;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_LowerFilters") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_LowerFilters") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_LowerFilters");
                                                                                 break;
                                                                             case 16:
                                                                                 devproperty = &DEVPKEY_Device_BusTypeGuid;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_BusTypeGuid") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_BusTypeGuid") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_BusTypeGuid");
                                                                                 break;
                                                                             case 17:
                                                                                 devproperty = &DEVPKEY_Device_LegacyBusType;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_LegacyBusType") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_LegacyBusType") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_LegacyBusType");
                                                                                 break;
                                                                             case 18:
                                                                                 devproperty = &DEVPKEY_Device_BusNumber;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_BusNumber") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_BusNumber") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_BusNumber");
                                                                                 break;
                                                                             case 19:
                                                                                 devproperty = &DEVPKEY_Device_EnumeratorName;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_EnumeratorName") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_EnumeratorName") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_EnumeratorName");
                                                                                 break;
                                                                             case 20:
                                                                                 devproperty = &DEVPKEY_Device_Security;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Security") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Security") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Security");
                                                                                 break;
                                                                             case 21:
                                                                                 devproperty = &DEVPKEY_Device_SecuritySDS;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_SecuritySDS") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_SecuritySDS") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_SecuritySDS");
                                                                                 break;
                                                                             case 22:
                                                                                 devproperty = &DEVPKEY_Device_DevType;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DevType") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DevType") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DevType");
                                                                                 break;
                                                                             case 23:
                                                                                 devproperty = &DEVPKEY_Device_Exclusive;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Exclusive") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Exclusive") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Exclusive");
                                                                                 break;
                                                                             case 24:
                                                                                 devproperty = &DEVPKEY_Device_Characteristics;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Characteristics") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Characteristics") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Characteristics");
                                                                                 break;
                                                                             case 25:
                                                                                 devproperty = &DEVPKEY_Device_Address;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Address") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Address") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Address");
                                                                                 break;
                                                                             case 26:
                                                                                 devproperty = &DEVPKEY_Device_UINumberDescFormat;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_UINumberDescFormat") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_UINumberDescFormat") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_UINumberDescFormat");
                                                                                 break;
                                                                             case 27:
                                                                                 devproperty = &DEVPKEY_Device_PowerData;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_PowerData") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_PowerData") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_PowerData");
                                                                                 //type = CM_POWER_DATA
                                                                                 break;
                                                                             case 28:
                                                                                 devproperty = &DEVPKEY_Device_RemovalPolicy;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_RemovalPolicy") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_RemovalPolicy") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_RemovalPolicy");
                                                                                 break;
                                                                             case 29:
                                                                                 devproperty = &DEVPKEY_Device_RemovalPolicyDefault;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_RemovalPolicyDefault") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_RemovalPolicyDefault") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_RemovalPolicyDefault");
                                                                                 break;
                                                                             case 30:
                                                                                 devproperty = &DEVPKEY_Device_RemovalPolicyOverride;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_RemovalPolicyOverride") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_RemovalPolicyOverride") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_RemovalPolicyOverride");
                                                                                 break;
                                                                             case 31:
                                                                                 devproperty = &DEVPKEY_Device_InstallState;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_InstallState") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_InstallState") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_InstallState");
                                                                                 break;
                                                                             case 32:
                                                                                 devproperty = &DEVPKEY_Device_LocationPaths;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_LocationPaths") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_LocationPaths") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_LocationPaths");
                                                                                 break;
                                                                             case 33:
                                                                                 devproperty = &DEVPKEY_Device_BaseContainerId;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_BaseContainerId") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_BaseContainerId") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_BaseContainerId");
                                                                                 break;
                                                                             case 34:
                                                                                 devproperty = &DEVPKEY_Device_InstanceId;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_InstanceId") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_InstanceId") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_InstanceId");
                                                                                 break;
                                                                             case 35:
                                                                                 devproperty = &DEVPKEY_Device_DevNodeStatus;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DevNodeStatus") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DevNodeStatus") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DevNodeStatus");
                                                                                 break;
                                                                             case 36:
                                                                                 devproperty = &DEVPKEY_Device_ProblemCode;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ProblemCode") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ProblemCode") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ProblemCode");
                                                                                 break;
                                                                             case 37:
                                                                                 devproperty = &DEVPKEY_Device_EjectionRelations;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_EjectionRelations") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_EjectionRelations") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_EjectionRelations");
                                                                                 break;
                                                                             case 38:
                                                                                 devproperty = &DEVPKEY_Device_RemovalRelations;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_RemovalRelations") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_RemovalRelations") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_RemovalRelations");
                                                                                 break;
                                                                             case 39:
                                                                                 devproperty = &DEVPKEY_Device_PowerRelations;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_PowerRelations") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_PowerRelations") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_PowerRelations");
                                                                                 break;
                                                                             case 40:
                                                                                 devproperty = &DEVPKEY_Device_BusRelations;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_BusRelations") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_BusRelations") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_BusRelations");
                                                                                 break;
                                                                             case 41:
                                                                                 devproperty = &DEVPKEY_Device_Parent;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Parent") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Parent") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Parent");
                                                                                 break;
                                                                             case 42:
                                                                                 devproperty = &DEVPKEY_Device_Children;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Children") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Children") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Children");
                                                                                 break;
                                                                             case 43:
                                                                                 devproperty = &DEVPKEY_Device_Siblings;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Siblings") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Siblings") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Siblings");
                                                                                 break;
                                                                             case 44:
                                                                                 devproperty = &DEVPKEY_Device_TransportRelations;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_TransportRelations") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_TransportRelations") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_TransportRelations");
                                                                                 break;
                                                                             case 45:
                                                                                 devproperty = &DEVPKEY_Device_ProblemStatus;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ProblemStatus") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ProblemStatus") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ProblemStatus");
                                                                                 break;
                                                                             case 46:
                                                                                 devproperty = &DEVPKEY_Device_Reported;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Reported") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Reported") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Reported");
                                                                                 break;
                                                                             case 47:
                                                                                 devproperty = &DEVPKEY_Device_Legacy;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Legacy") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Legacy") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Legacy");
                                                                                 break;
                                                                             case 48:
                                                                                 devproperty = &DEVPKEY_Device_ContainerId;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ContainerId") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ContainerId") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ContainerId");
                                                                                 break;
                                                                             case 49:
                                                                                 devproperty = &DEVPKEY_Device_InLocalMachineContainer;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_InLocalMachineContainer") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
-                                                                                snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_InLocalMachineContainer");;
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_InLocalMachineContainer") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
+                                                                                snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_InLocalMachineContainer");
                                                                                 break;
                                                                             case 50:
                                                                                 devproperty = &DEVPKEY_Device_Model;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Model") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Model") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Model");
                                                                                 break;
                                                                             case 51:
                                                                                 devproperty = &DEVPKEY_Device_ModelId;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ModelId") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ModelId") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ModelId");
                                                                                 break;
                                                                             case 52:
                                                                                 devproperty = &DEVPKEY_Device_FriendlyNameAttributes;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_FriendlyNameAttributes") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_FriendlyNameAttributes") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_FriendlyNameAttributes");
                                                                                 break;
                                                                             case 53:
                                                                                 devproperty = &DEVPKEY_Device_ManufacturerAttributes;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ManufacturerAttributes") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ManufacturerAttributes") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ManufacturerAttributes");
                                                                                 break;
                                                                             case 54:
                                                                                 devproperty = &DEVPKEY_Device_PresenceNotForDevice;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_PresenceNotForDevice") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_PresenceNotForDevice") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_PresenceNotForDevice");
                                                                                 break;
                                                                             case 55:
                                                                                 devproperty = &DEVPKEY_Device_SignalStrength;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_SignalStrength") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_SignalStrength") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_SignalStrength");
                                                                                 break;
                                                                             case 56:
                                                                                 devproperty = &DEVPKEY_Device_IsAssociateableByUserAction;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_IsAssociateableByUserAction") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_IsAssociateableByUserAction") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_IsAssociateableByUserAction");
                                                                                 break;
                                                                             case 57:
                                                                                 devproperty = &DEVPKEY_Device_ShowInUninstallUI;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ShowInUninstallUI") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ShowInUninstallUI") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ShowInUninstallUI");
                                                                                 break;
                                                                             case 58:
                                                                                 devproperty = &DEVPKEY_Device_Numa_Proximity_Domain;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Numa_Proximity_Domain") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Numa_Proximity_Domain") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Numa_Proximity_Domain");
                                                                                 break;
                                                                             case 59:
                                                                                 devproperty = &DEVPKEY_Device_DHP_Rebalance_Policy;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DHP_Rebalance_Policy") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DHP_Rebalance_Policy") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DHP_Rebalance_Policy");
                                                                                 break;
                                                                             case 60:
                                                                                 devproperty = &DEVPKEY_Device_Numa_Node;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Numa_Node") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Numa_Node") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Numa_Node");
                                                                                 break;
                                                                             case 61:
                                                                                 devproperty = &DEVPKEY_Device_BusReportedDeviceDesc;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_BusReportedDeviceDesc") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_BusReportedDeviceDesc") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_BusReportedDeviceDesc");
                                                                                 break;
                                                                             case 62:
                                                                                 devproperty = &DEVPKEY_Device_IsPresent;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_IsPresent") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_IsPresent") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_IsPresent");
                                                                                 break;
                                                                             case 63:
                                                                                 devproperty = &DEVPKEY_Device_HasProblem;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_HasProblem") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_HasProblem") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_HasProblem");
                                                                                 break;
                                                                             case 64:
                                                                                 devproperty = &DEVPKEY_Device_ConfigurationId;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ConfigurationId") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ConfigurationId") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ConfigurationId");
                                                                                 break;
                                                                             case 65:
                                                                                 devproperty = &DEVPKEY_Device_ReportedDeviceIdsHash;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ReportedDeviceIdsHash") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ReportedDeviceIdsHash") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ReportedDeviceIdsHash");
                                                                                 break;
                                                                             case 66:
                                                                                 devproperty = &DEVPKEY_Device_PhysicalDeviceLocation;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_PhysicalDeviceLocation") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_PhysicalDeviceLocation") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_PhysicalDeviceLocation");
                                                                                 break;
                                                                             case 67:
                                                                                 devproperty = &DEVPKEY_Device_BiosDeviceName;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_BiosDeviceName") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_BiosDeviceName") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_BiosDeviceName");
                                                                                 break;
                                                                             case 68:
                                                                                 devproperty = &DEVPKEY_Device_DriverProblemDesc;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverProblemDesc") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverProblemDesc") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverProblemDesc");
                                                                                 break;
                                                                             case 69:
                                                                                 devproperty = &DEVPKEY_Device_DebuggerSafe;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DebuggerSafe") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DebuggerSafe") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DebuggerSafe");
                                                                                 break;
                                                                             case 70:
                                                                                 devproperty = &DEVPKEY_Device_PostInstallInProgress;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_PostInstallInProgress") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_PostInstallInProgress") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_PostInstallInProgress");
                                                                                 break;
                                                                             case 71:
                                                                                 devproperty = &DEVPKEY_Device_Stack;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_Stack") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_Stack") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_Stack");
                                                                                 break;
                                                                             case 72:
                                                                                 devproperty = &DEVPKEY_Device_ExtendedConfigurationIds;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ExtendedConfigurationIds") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ExtendedConfigurationIds") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ExtendedConfigurationIds");
                                                                                 break;
                                                                             case 73:
                                                                                 devproperty = &DEVPKEY_Device_IsRebootRequired;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_IsRebootRequired") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_IsRebootRequired") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_IsRebootRequired");
                                                                                 break;
                                                                             case 74:
                                                                                 devproperty = &DEVPKEY_Device_FirmwareDate;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_FirmwareDate") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_FirmwareDate") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_FirmwareDate");
                                                                                 break;
                                                                             case 75:
                                                                                 devproperty = &DEVPKEY_Device_FirmwareVersion;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_FirmwareVersion") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_FirmwareVersion") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_FirmwareVersion");
                                                                                 break;
                                                                             case 76:
                                                                                 devproperty = &DEVPKEY_Device_FirmwareRevision;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_FirmwareRevision") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_FirmwareRevision") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_FirmwareRevision");
                                                                                 break;
                                                                             case 77:
                                                                                 devproperty = &DEVPKEY_Device_DependencyProviders;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DependencyProviders") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DependencyProviders") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DependencyProviders");
                                                                                 break;
                                                                             case 78:
                                                                                 devproperty = &DEVPKEY_Device_DependencyDependents;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DependencyDependents") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DependencyDependents") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DependencyDependents");
                                                                                 break;
                                                                             case 79:
                                                                                 devproperty = &DEVPKEY_Device_SoftRestartSupported;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_SoftRestartSupported") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_SoftRestartSupported") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_SoftRestartSupported");
                                                                                 break;
                                                                             case 80:
                                                                                 devproperty = &DEVPKEY_Device_ExtendedAddress;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ExtendedAddress") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ExtendedAddress") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ExtendedAddress");
                                                                                 break;
                                                                             case 81:
                                                                                 devproperty = &DEVPKEY_Device_SessionId;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_SessionId") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_SessionId") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_SessionId");
                                                                                 break;
                                                                             case 82:
                                                                                 devproperty = &DEVPKEY_Device_InstallDate;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_InstallDate") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_InstallDate") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_InstallDate");
                                                                                 break;
                                                                             case 83:
                                                                                 devproperty = &DEVPKEY_Device_FirstInstallDate;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_FirstInstallDate") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_FirstInstallDate") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_FirstInstallDate");
                                                                                 break;
                                                                             case 84:
                                                                                 devproperty = &DEVPKEY_Device_LastArrivalDate;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_LastArrivalDate") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_LastArrivalDate") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_LastArrivalDate");
                                                                                 break;
                                                                             case 85:
                                                                                 devproperty = &DEVPKEY_Device_LastRemovalDate;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_LastRemovalDate") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_LastRemovalDate") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_LastRemovalDate");
                                                                                 break;
                                                                             case 86:
                                                                                 devproperty = &DEVPKEY_Device_DriverDate;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverDate") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverDate") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverDate");
                                                                                 break;
                                                                             case 87:
                                                                                 devproperty = &DEVPKEY_Device_DriverVersion;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverVersion") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverVersion") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverVersion");
                                                                                 break;
                                                                             case 88:
                                                                                 devproperty = &DEVPKEY_Device_DriverDesc;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverDesc") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverDesc") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverDesc");
                                                                                 break;
                                                                             case 89:
                                                                                 devproperty = &DEVPKEY_Device_DriverInfPath;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverInfPath") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverInfPath") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverInfPath");
                                                                                 break;
                                                                             case 90:
                                                                                 devproperty = &DEVPKEY_Device_DriverInfSection;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverInfSection") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverInfSection") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverInfSection");
                                                                                 break;
                                                                             case 91:
                                                                                 devproperty = &DEVPKEY_Device_DriverInfSectionExt;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverInfSectionExt") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverInfSectionExt") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverInfSectionExt");
                                                                                 break;
                                                                             case 92:
                                                                                 devproperty = &DEVPKEY_Device_MatchingDeviceId;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_MatchingDeviceId") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_MatchingDeviceId") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_MatchingDeviceId");
                                                                                 break;
                                                                             case 93:
                                                                                 devproperty = &DEVPKEY_Device_DriverProvider;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverProvider") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverProvider") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverProvider");
                                                                                 break;
                                                                             case 94:
                                                                                 devproperty = &DEVPKEY_Device_DriverPropPageProvider;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverPropPageProvider") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverPropPageProvider") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverPropPageProvider");
                                                                                 break;
                                                                             case 95:
                                                                                 devproperty = &DEVPKEY_Device_DriverCoInstallers;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverCoInstallers") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverCoInstallers") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverCoInstallers");
                                                                                 break;
                                                                             case 96:
                                                                                 devproperty = &DEVPKEY_Device_ResourcePickerTags;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ResourcePickerTags") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ResourcePickerTags") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ResourcePickerTags");
                                                                                 break;
                                                                             case 97:
                                                                                 devproperty = &DEVPKEY_Device_ResourcePickerExceptions;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_ResourcePickerExceptions") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_ResourcePickerExceptions") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_ResourcePickerExceptions");
                                                                                 break;
                                                                             case 98:
                                                                                 devproperty = &DEVPKEY_Device_DriverRank;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverRank") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverRank") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverRank");
                                                                                 break;
                                                                             case 99:
                                                                                 devproperty = &DEVPKEY_Device_DriverLogoLevel;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_DriverLogoLevel") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_DriverLogoLevel") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_DriverLogoLevel");
                                                                                 break;
                                                                             case 100:
                                                                                 devproperty = &DEVPKEY_Device_NoConnectSound;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_NoConnectSound") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_NoConnectSound") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_NoConnectSound");
                                                                                 break;
                                                                             case 101:
                                                                                 devproperty = &DEVPKEY_Device_GenericDriverInstalled;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_GenericDriverInstalled") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_GenericDriverInstalled") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_GenericDriverInstalled");
                                                                                 break;
                                                                             case 102:
                                                                                 devproperty = &DEVPKEY_Device_AdditionalSoftwareRequested;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_AdditionalSoftwareRequested") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_AdditionalSoftwareRequested") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_AdditionalSoftwareRequested");
                                                                                 break;
                                                                             case 103:
                                                                                 devproperty = &DEVPKEY_Device_SafeRemovalRequired;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_SafeRemovalRequired") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_SafeRemovalRequired") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_SafeRemovalRequired");
                                                                                 break;
                                                                             case 104:
                                                                                 devproperty = &DEVPKEY_Device_SafeRemovalRequiredOverride;
-                                                                                propertyNameLength = strlen("DEVPKEY_Device_SafeRemovalRequiredOverride") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_Device_SafeRemovalRequiredOverride") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_Device_SafeRemovalRequiredOverride");
                                                                                 break;
                                                                             case 105:
                                                                                 devproperty = &DEVPKEY_DrvPkg_Model;
-                                                                                propertyNameLength = strlen("DEVPKEY_DrvPkg_Model") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DrvPkg_Model") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DrvPkg_Model");
                                                                                 break;
                                                                             case 106:
                                                                                 devproperty = &DEVPKEY_DrvPkg_VendorWebSite;
-                                                                                propertyNameLength = strlen("DEVPKEY_DrvPkg_VendorWebSite") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DrvPkg_VendorWebSite") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DrvPkg_VendorWebSite");
                                                                                 break;
                                                                             case 107:
                                                                                 devproperty = &DEVPKEY_DrvPkg_DetailedDescription;
-                                                                                propertyNameLength = strlen("DEVPKEY_DrvPkg_DetailedDescription") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DrvPkg_DetailedDescription") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DrvPkg_DetailedDescription");
                                                                                 break;
                                                                             case 108:
                                                                                 devproperty = &DEVPKEY_DrvPkg_DocumentationLink;
-                                                                                propertyNameLength = strlen("DEVPKEY_DrvPkg_DocumentationLink") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DrvPkg_DocumentationLink") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DrvPkg_DocumentationLink");
                                                                                 break;
                                                                             case 109:
                                                                                 devproperty = &DEVPKEY_DrvPkg_Icon;
-                                                                                propertyNameLength = strlen("DEVPKEY_DrvPkg_Icon") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DrvPkg_Icon") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DrvPkg_Icon");
                                                                                 break;
                                                                             case 110:
                                                                                 devproperty = &DEVPKEY_DrvPkg_BrandingIcon;
-                                                                                propertyNameLength = strlen("DEVPKEY_DrvPkg_BrandingIcon") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DrvPkg_BrandingIcon") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DrvPkg_BrandingIcon");
                                                                                 break;
                                                                             case 111:
                                                                                 devproperty = &DEVPKEY_DeviceClass_UpperFilters;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_UpperFilters") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_UpperFilters") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_UpperFilters");
                                                                                 break;
                                                                             case 112:
                                                                                 devproperty = &DEVPKEY_DeviceClass_LowerFilters;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_LowerFilters") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_LowerFilters") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_LowerFilters");
                                                                                 break;
                                                                             case 113:
                                                                                 devproperty = &DEVPKEY_DeviceClass_Security;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_Security") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_Security") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_Security");
                                                                                 break;
                                                                             case 114:
                                                                                 devproperty = &DEVPKEY_DeviceClass_SecuritySDS;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_SecuritySDS") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_SecuritySDS") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_SecuritySDS");
                                                                                 break;
                                                                             case 115:
                                                                                 devproperty = &DEVPKEY_DeviceClass_DevType;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_DevType") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_DevType") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_DevType");
                                                                                 break;
                                                                             case 116:
                                                                                 devproperty = &DEVPKEY_DeviceClass_Exclusive;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_Exclusive") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_Exclusive") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_Exclusive");
                                                                                 break;
                                                                             case 117:
                                                                                 devproperty = &DEVPKEY_DeviceClass_Characteristics;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_Characteristics") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_Characteristics") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_Characteristics");
                                                                                 break;
                                                                             case 118:
                                                                                 devproperty = &DEVPKEY_DeviceClass_Name;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_Name") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_Name") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_Name");
                                                                                 break;
                                                                             case 119:
                                                                                 devproperty = &DEVPKEY_DeviceClass_ClassName;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_ClassName") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_ClassName") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_ClassName");
                                                                                 break;
                                                                             case 120:
                                                                                 devproperty = &DEVPKEY_DeviceClass_Icon;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_Icon") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_Icon") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_Icon");
                                                                                 break;
                                                                             case 121:
                                                                                 devproperty = &DEVPKEY_DeviceClass_ClassInstaller;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_ClassInstaller") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_ClassInstaller") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_ClassInstaller");
                                                                                 break;
                                                                             case 122:
                                                                                 devproperty = &DEVPKEY_DeviceClass_PropPageProvider;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_PropPageProvider") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_PropPageProvider") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_PropPageProvider");
                                                                                 break;
                                                                             case 123:
                                                                                 devproperty = &DEVPKEY_DeviceClass_NoInstallClass;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_NoInstallClass") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_NoInstallClass") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_NoInstallClass");
                                                                                 break;
                                                                             case 124:
                                                                                 devproperty = &DEVPKEY_DeviceClass_NoDisplayClass;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_NoDisplayClass") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_NoDisplayClass") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_NoDisplayClass");
                                                                                 break;
                                                                             case 125:
                                                                                 devproperty = &DEVPKEY_DeviceClass_SilentInstall;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_SilentInstall") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_SilentInstall") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_SilentInstall");
                                                                                 break;
                                                                             case 126:
                                                                                 devproperty = &DEVPKEY_DeviceClass_NoUseClass;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_NoUseClass") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_NoUseClass") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_NoUseClass");
                                                                                 break;
                                                                             case 127:
                                                                                 devproperty = &DEVPKEY_DeviceClass_DefaultService;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_DefaultService") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_DefaultService") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_DefaultService");
                                                                                 break;
                                                                             case 128:
                                                                                 devproperty = &DEVPKEY_DeviceClass_IconPath;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_IconPath") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_IconPath") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_IconPath");
                                                                                 break;
                                                                             case 129:
                                                                                 devproperty = &DEVPKEY_DeviceClass_DHPRebalanceOptOut;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_DHPRebalanceOptOut") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_DHPRebalanceOptOut") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_DHPRebalanceOptOut");
                                                                                 break;
                                                                             case 130:
                                                                                 devproperty = &DEVPKEY_DeviceClass_ClassCoInstallers;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceClass_ClassCoInstallers") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceClass_ClassCoInstallers") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceClass_ClassCoInstallers");
                                                                                 break;
                                                                             case 131:
                                                                                 devproperty = &DEVPKEY_DeviceInterface_FriendlyName;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceInterface_FriendlyName") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceInterface_FriendlyName") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceInterface_FriendlyName");
                                                                                 break;
                                                                             case 132:
                                                                                 devproperty = &DEVPKEY_DeviceInterface_Enabled;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceInterface_Enabled") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceInterface_Enabled") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceInterface_Enabled");
                                                                                 break;
                                                                             case 133:
                                                                                 devproperty = &DEVPKEY_DeviceInterface_ClassGuid;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceInterface_ClassGuid") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceInterface_ClassGuid") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceInterface_ClassGuid");
                                                                                 break;
                                                                             case 134:
                                                                                 devproperty = &DEVPKEY_DeviceInterface_ReferenceString;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceInterface_ReferenceString") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceInterface_ReferenceString") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceInterface_ReferenceString");
                                                                                 break;
                                                                             case 135:
                                                                                 devproperty = &DEVPKEY_DeviceInterface_Restricted;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceInterface_Restricted") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceInterface_Restricted") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceInterface_Restricted");
                                                                                 break;
                                                                             case 136:
                                                                                 devproperty = &DEVPKEY_DeviceInterface_UnrestrictedAppCapabilities;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceInterface_UnrestrictedAppCapabilities") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceInterface_UnrestrictedAppCapabilities") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceInterface_UnrestrictedAppCapabilities");
                                                                                 break;
                                                                             case 137:
                                                                                 devproperty = &DEVPKEY_DeviceInterface_SchematicName;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceInterface_SchematicName") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceInterface_SchematicName") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceInterface_SchematicName");
                                                                                 break;
                                                                             case 138:
                                                                                 devproperty = &DEVPKEY_DeviceInterfaceClass_DefaultInterface;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceInterfaceClass_DefaultInterface") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceInterfaceClass_DefaultInterface") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceInterfaceClass_DefaultInterface");
                                                                                 break;
                                                                             case 139:
                                                                                 devproperty = &DEVPKEY_DeviceInterfaceClass_Name;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceInterfaceClass_Name") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceInterfaceClass_Name") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceInterfaceClass_Name");
                                                                                 break;
                                                                             case 140:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Address;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_Address") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_Address") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Address");
                                                                                 break;
                                                                             case 141:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_DiscoveryMethod;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_DiscoveryMethod") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_DiscoveryMethod") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_DiscoveryMethod");
                                                                                 break;
                                                                             case 142:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsEncrypted;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsEncrypted") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsEncrypted") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsEncrypted");
                                                                                 break;
                                                                             case 143:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsAuthenticated;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsAuthenticated") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsAuthenticated") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsAuthenticated");
                                                                                 break;
                                                                             case 144:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsConnected;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsConnected") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsConnected") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsConnected");
                                                                                 break;
                                                                             case 145:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsPaired;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsPaired") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsPaired") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsPaired");
                                                                                 break;
                                                                             case 146:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Icon;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_Icon") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_Icon") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Icon");
                                                                                 break;
                                                                             case 147:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Version;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_Version") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_Version") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Version");
                                                                                 break;
                                                                             case 148:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Last_Seen;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_Last_Seen") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_Last_Seen") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Last_Seen");
                                                                                 break;
                                                                             case 149:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Last_Connected;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_Last_Connected") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_Last_Connected") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Last_Connected");
                                                                                 break;
                                                                             case 150:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsShowInDisconnectedState;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsShowInDisconnectedState") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsShowInDisconnectedState") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsShowInDisconnectedState");
                                                                                 break;
                                                                             case 151:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsLocalMachine;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsLocalMachine") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsLocalMachine") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsLocalMachine");
                                                                                 break;
                                                                             case 152:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_MetadataPath;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_MetadataPath") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_MetadataPath") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_MetadataPath");
                                                                                 break;
                                                                             case 153:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsMetadataSearchInProgress;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsMetadataSearchInProgress") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsMetadataSearchInProgress") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsMetadataSearchInProgress");
                                                                                 break;
                                                                             case 154:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_MetadataChecksum;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_MetadataChecksum") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_MetadataChecksum") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_MetadataChecksum");
                                                                                 break;
                                                                             case 155:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsNotInterestingForDisplay;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsNotInterestingForDisplay") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsNotInterestingForDisplay") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsNotInterestingForDisplay");
                                                                                 break;
                                                                             case 156:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_LaunchDeviceStageOnDeviceConnect;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_LaunchDeviceStageOnDeviceConnect") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_LaunchDeviceStageOnDeviceConnect") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_LaunchDeviceStageOnDeviceConnect");
                                                                                 break;
                                                                             case 157:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_LaunchDeviceStageFromExplorer;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_LaunchDeviceStageFromExplorer") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_LaunchDeviceStageFromExplorer") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_LaunchDeviceStageFromExplorer");
                                                                                 break;
                                                                             case 158:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_BaselineExperienceId;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_BaselineExperienceId") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_BaselineExperienceId") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_BaselineExperienceId");
                                                                                 break;
                                                                             case 159:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsDeviceUniquelyIdentifiable;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsDeviceUniquelyIdentifiable") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsDeviceUniquelyIdentifiable") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsDeviceUniquelyIdentifiable");
                                                                                 break;
                                                                             case 160:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_AssociationArray;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_AssociationArray") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_AssociationArray") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_AssociationArray");
                                                                                 break;
                                                                             case 161:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_DeviceDescription1;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_DeviceDescription1") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_DeviceDescription1") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_DeviceDescription1");
                                                                                 break;
                                                                             case 162:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_DeviceDescription2;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_DeviceDescription2") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_DeviceDescription2") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_DeviceDescription2");
                                                                                 break;
                                                                             case 163:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_HasProblem;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_HasProblem") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_HasProblem") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_HasProblem");
                                                                                 break;
                                                                             case 164:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsSharedDevice;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsSharedDevice") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsSharedDevice") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsSharedDevice");
                                                                                 break;
                                                                             case 165:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsNetworkDevice;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsNetworkDevice") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsNetworkDevice") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsNetworkDevice");
                                                                                 break;
                                                                             case 166:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsDefaultDevice;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsDefaultDevice") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsDefaultDevice") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsDefaultDevice");
                                                                                 break;
                                                                             case 167:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_MetadataCabinet;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_MetadataCabinet") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_MetadataCabinet") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_MetadataCabinet");
                                                                                 break;
                                                                             case 168:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_RequiresPairingElevation;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_RequiresPairingElevation") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_RequiresPairingElevation") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_RequiresPairingElevation");
                                                                                 break;
                                                                             case 169:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_ExperienceId;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_ExperienceId") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_ExperienceId") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_ExperienceId");
                                                                                 break;
                                                                             case 170:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Category;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceDEVPKEY_DeviceContainer_Category_HardwareIds") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceDEVPKEY_DeviceContainer_Category_HardwareIds") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Category");
                                                                                 break;
                                                                             case 171:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Category_Desc_Singular;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_Category_Desc_Singular") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_Category_Desc_Singular") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Category_Desc_Singular");
                                                                                 break;
                                                                             case 172:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Category_Desc_Plural;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_Category_Desc_Plural") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_Category_Desc_Plural") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Category_Desc_Plural");
                                                                                 break;
                                                                             case 173:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Category_Icon;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_Category_Icon") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_Category_Icon") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Category_Icon");
                                                                                 break;
                                                                             case 174:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_CategoryGroup_Desc;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_CategoryGroup_Desc") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_CategoryGroup_Desc") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_CategoryGroup_Desc");
                                                                                 break;
                                                                             case 175:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_CategoryGroup_Icon;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_CategoryGroup_Icon") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_CategoryGroup_Icon") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_CategoryGroup_Icon");
                                                                                 break;
                                                                             case 176:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_PrimaryCategory;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_PrimaryCategory") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_PrimaryCategory") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_PrimaryCategory");
                                                                                 break;
                                                                             case 178:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_UnpairUninstall;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_UnpairUninstall") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_UnpairUninstall") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_UnpairUninstall");
                                                                                 break;
                                                                             case 179:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_RequiresUninstallElevation;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_RequiresUninstallElevation") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_RequiresUninstallElevation") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_RequiresUninstallElevation");
                                                                                 break;
                                                                             case 180:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_DeviceFunctionSubRank;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_DeviceFunctionSubRank") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_DeviceFunctionSubRank") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_DeviceFunctionSubRank");
                                                                                 break;
                                                                             case 181:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_AlwaysShowDeviceAsConnected;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_AlwaysShowDeviceAsConnected") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_AlwaysShowDeviceAsConnected") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_AlwaysShowDeviceAsConnected");
                                                                                 break;
                                                                             case 182:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_ConfigFlags;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_ConfigFlags") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_ConfigFlags") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_ConfigFlags");
                                                                                 break;
                                                                             case 183:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_PrivilegedPackageFamilyNames;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_PrivilegedPackageFamilyNames") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_PrivilegedPackageFamilyNames") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_PrivilegedPackageFamilyNames");
                                                                                 break;
                                                                             case 184:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_CustomPrivilegedPackageFamilyNames;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_CustomPrivilegedPackageFamilyNames") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_CustomPrivilegedPackageFamilyNames") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_CustomPrivilegedPackageFamilyNames");
                                                                                 break;
                                                                             case 185:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_IsRebootRequired;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_IsRebootRequired") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_IsRebootRequired") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_IsRebootRequired");
                                                                                 break;
                                                                             case 186:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_FriendlyName;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_FriendlyName") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_FriendlyName") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_FriendlyName");
                                                                                 break;
                                                                             case 187:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_Manufacturer;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_Manufacturer") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_Manufacturer") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_Manufacturer");
                                                                                 break;
                                                                             case 188:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_ModelName;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_ModelName") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_ModelName") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_ModelName");
                                                                                 break;
                                                                             case 189:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_ModelNumber;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_ModelNumber") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_ModelNumber") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_ModelNumber");
                                                                                 break;
                                                                             case 190:
                                                                                 devproperty = &DEVPKEY_DeviceContainer_InstallInProgress;
-                                                                                propertyNameLength = strlen("DEVPKEY_DeviceContainer_InstallInProgress") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DeviceContainer_InstallInProgress") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DeviceContainer_InstallInProgress");
                                                                                 break;
                                                                             case 191:
                                                                                 devproperty = &DEVPKEY_DevQuery_ObjectType;
-                                                                                propertyNameLength = strlen("DEVPKEY_DevQuery_ObjectType") + 1;
-                                                                                propertyName = C_CAST(char*, calloc(propertyNameLength, sizeof(char)));
+                                                                                propertyNameLength = safe_strlen("DEVPKEY_DevQuery_ObjectType") + 1;
+                                                                                propertyName = C_CAST(char*, safe_calloc(propertyNameLength, sizeof(char)));
                                                                                 snprintf(propertyName, propertyNameLength, "DEVPKEY_DevQuery_ObjectType");
                                                                                 break;
                                                                             default:
-                                                                                devproperty = NULL;
+                                                                                devproperty = M_NULLPTR;
                                                                                 break;
                                                                             }
                                                                             propertyBufLen = 0;
-                                                                            cmRet = CM_Get_DevNode_PropertyW(propInst, devproperty, &propertyType, NULL, &propertyBufLen, 0);
+                                                                            cmRet = CM_Get_DevNode_PropertyW(propInst, devproperty, &propertyType, M_NULLPTR, &propertyBufLen, 0);
                                                                             if (CR_SUCCESS == cmRet || CR_INVALID_POINTER == cmRet || CR_BUFFER_SMALL == cmRet)//We'll probably get an invalid pointer or small buffer, but this will return the size of the buffer we need, so allow it through - TJE
                                                                             {
-                                                                                PBYTE propertyBuf = C_CAST(PBYTE, calloc(propertyBufLen + 1, sizeof(BYTE)));
+                                                                                PBYTE propertyBuf = C_CAST(PBYTE, safe_calloc(propertyBufLen + 1, sizeof(BYTE)));
                                                                                 if (propertyBuf)
                                                                                 {
                                                                                     propertyBufLen += 1;
@@ -1733,7 +1913,8 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                                                                                             uint64_t wholePart = C_CAST(uint64_t, floor(*date));
                                                                                             double fractionPart = *date - wholePart;
                                                                                             printf("date = %f, whole = %llu, fraction = %0.02f\n", *date, wholePart, fractionPart);
-                                                                                            //TODO: finish writing this conversion...
+                                                                                            //If we need this converted, we can do it but it will take more work.
+                                                                                            //Currently only using this when debugging and raw data above is enough
                                                                                         }
                                                                                         break;
                                                                                         case DEVPROP_TYPE_FILETIME:
@@ -1741,7 +1922,7 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                                                                                             FILETIME *fileTime = C_CAST(FILETIME*, propertyBuf);
                                                                                             SYSTEMTIME systemTime;
                                                                                             TIME_ZONE_INFORMATION currentTimeZone;
-                                                                                            //DWORD tzret = 
+                                                                                            //DWORD tzret =
                                                                                             GetTimeZoneInformation(&currentTimeZone);//need this to adjust the converted time below. note, return value specifies std vs dst time (1 vs 2). 0 is unknown.
                                                                                             if (FileTimeToSystemTime(fileTime, &systemTime))
                                                                                             {
@@ -1778,13 +1959,13 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                                                                                         }
                                                                                     }
                                                                                 }
-                                                                                safe_Free(propertyBuf)
+                                                                                safe_free(&propertyBuf);
                                                                             }
                                                                             //else
                                                                             //{
                                                                             //    printf("\tUnable to find requested property\n");
                                                                             //}
-                                                                            safe_Free(propertyName)
+                                                                            safe_free(&propertyName);
                                                                             ++counter;
                                                                         }
                                                                         ++instanceCounter;
@@ -1800,156 +1981,100 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                                                                 /*/
                                                                 //*/
 
-                                                                //here is where we need to parse the USB VID/PID or TODO: PCI Vendor, Product, and Revision numbers
-                                                                if (_tcsncmp(TEXT("USB"), parentBuffer, _tcsclen(TEXT("USB"))) == 0)
+                                                                if (!get_IDs_From_TCHAR_String(parentInst, parentBuffer, parentLen, device))
                                                                 {
-                                                                    ULONG propertyBufLen = 0;
-                                                                    DEVPROPTYPE propertyType = 0;
-        #if defined (_MSC_VER) && _MSC_VER < SEA_MSC_VER_VS2015
-                                                                    //This is a hack around how VS2013 handles string concatenation with how the printf format macros were defined for it versus newer versions.
-                                                                    int scannedVals = _sntscanf_s(parentBuffer, parentLen, TEXT("USB\\VID_%x&PID_%x\\%*s"), &device->drive_info.adapter_info.vendorID, &device->drive_info.adapter_info.productID);
-        #else
-                                                                    int scannedVals = _sntscanf_s(parentBuffer, parentLen, TEXT("USB\\VID_%") TEXT(SCNx32) TEXT("&PID_%") TEXT(SCNx32) TEXT("\\%*s"), &device->drive_info.adapter_info.vendorID, &device->drive_info.adapter_info.productID);
-        #endif
-                                                                    device->drive_info.adapter_info.vendorIDValid = true;
-                                                                    device->drive_info.adapter_info.productIDValid = true;
-                                                                    if (scannedVals < 2)
+                                                                    //try the parent's parent. There are some cases where this seems to be necessary to get this data.
+                                                                    //one known case is AMD's RAID driver. There may be others
+                                                                    DEVINST pparentInst = 0;
+                                                                    cmRet = CM_Get_Parent(&pparentInst, parentInst, 0);
+                                                                    if (CR_SUCCESS == cmRet)
                                                                     {
-        #if defined (_DEBUG)
-                                                                        printf("Could not scan all values. Scanned %d values\n", scannedVals);
-        #endif
-                                                                    }
-                                                                    device->drive_info.adapter_info.infoType = ADAPTER_INFO_USB;
-                                                                    //unfortunately, this device ID doesn't have a revision in it for USB.
-                                                                    //We can do this other property request to read it, but it's wide characters only. No TCHARs allowed.
-                                                                    cmRet = CM_Get_DevNode_PropertyW(parentInst, &DEVPKEY_Device_HardwareIds, &propertyType, NULL, &propertyBufLen, 0);
-                                                                    if (CR_SUCCESS == cmRet || CR_INVALID_POINTER == cmRet || CR_BUFFER_SMALL == cmRet)//We'll probably get an invalid pointer or small buffer, but this will return the size of the buffer we need, so allow it through - TJE
-                                                                    {
-                                                                        PBYTE propertyBuf = C_CAST(PBYTE, calloc(propertyBufLen + 1, sizeof(BYTE)));
-                                                                        if (propertyBuf)
+                                                                        ULONG pparentLen = 0;
+                                                                        cmRet = CM_Get_Device_ID_Size(&pparentLen, pparentInst, 0);
+                                                                        pparentLen += 1;
+                                                                        if (CR_SUCCESS == cmRet)
                                                                         {
-                                                                            propertyBufLen += 1;
-                                                                            //NOTE: This key contains all 3 parts, VID, PID, and REV from the "parentInst": Example: USB\VID_174C&PID_2362&REV_0100
-                                                                            if (CR_SUCCESS == CM_Get_DevNode_PropertyW(parentInst, &DEVPKEY_Device_HardwareIds, &propertyType, propertyBuf, &propertyBufLen, 0))
+                                                                            TCHAR* pparentBuffer = C_CAST(TCHAR*, safe_calloc(pparentLen, sizeof(TCHAR)));
+                                                                            if (pparentBuffer)
                                                                             {
-                                                                                //multiple strings can be returned.
-                                                                                for (LPWSTR property = C_CAST(LPWSTR, propertyBuf); *property; property += wcslen(property) + 1)
+                                                                                cmRet = CM_Get_Device_ID(pparentInst, pparentBuffer, pparentLen, 0);
+                                                                                if (CR_SUCCESS == cmRet)
                                                                                 {
-                                                                                    if (property && (C_CAST(uintptr_t, property) - C_CAST(uintptr_t, propertyBuf)) < propertyBufLen && wcslen(property))
+                                                                                    if (!get_IDs_From_TCHAR_String(pparentInst, pparentBuffer, pparentLen, device))
                                                                                     {
-                                                                                        LPWSTR revisionStr = wcsstr(property, L"REV_");
-                                                                                        if (revisionStr)
-                                                                                        {
-                                                                                            if (1 == swscanf(revisionStr, L"REV_%x", &device->drive_info.adapter_info.revision))
-                                                                                            {
-                                                                                                device->drive_info.adapter_info.revisionValid = true;
-                                                                                                break;
-                                                                                            }
-                                                                                        }
+                                                                                        printf("Fatal error getting device IDs\n");
                                                                                     }
                                                                                 }
+                                                                                safe_free(&pparentBuffer);
                                                                             }
-                                                                            safe_Free(propertyBuf)
                                                                         }
                                                                     }
                                                                 }
-                                                                else if (_tcsncmp(TEXT("PCI"), parentBuffer, _tcsclen(TEXT("PCI"))) == 0)
-                                                                {
-                                                                    uint32_t subsystem = 0;
-                                                                    uint32_t revision = 0;
-        #if defined (_MSC_VER) && _MSC_VER  < SEA_MSC_VER_VS2015
-                                                                    //This is a hack around how VS2013 handles string concatenation with how the printf format macros were defined for it versus newer versions.
-                                                                    int scannedVals = _sntscanf_s(parentBuffer, parentLen, TEXT("PCI\\VEN_%lx&DEV_%lx&SUBSYS_%lx&REV_%lx\\%*s"), &device->drive_info.adapter_info.vendorID, &device->drive_info.adapter_info.productID, &subsystem, &revision);
-        #else
-                                                                    int scannedVals = _sntscanf_s(parentBuffer, parentLen, TEXT("PCI\\VEN_%") TEXT(SCNx32) TEXT("&DEV_%") TEXT(SCNx32) TEXT("&SUBSYS_%") TEXT(SCNx32) TEXT("&REV_%") TEXT(SCNx32) TEXT("\\%*s"), &device->drive_info.adapter_info.vendorID, &device->drive_info.adapter_info.productID, &subsystem, &revision);
-        #endif
-                                                                    device->drive_info.adapter_info.vendorIDValid = true;
-                                                                    device->drive_info.adapter_info.productIDValid = true;
-                                                                    device->drive_info.adapter_info.revision = revision;
-                                                                    device->drive_info.adapter_info.revisionValid = true;
-                                                                    device->drive_info.adapter_info.infoType = ADAPTER_INFO_PCI;
-                                                                    if (scannedVals < 4)
-                                                                    {
-        #if defined (_DEBUG)
-                                                                        printf("Could not scan all values. Scanned %d values\n", scannedVals);
-        #endif
-                                                                    }
-                                                                    //can also read DEVPKEY_Device_HardwareIds for parentInst to get all this data
-                                                                }
-                                                                else if (_tcsncmp(TEXT("1394"), parentBuffer, _tcsclen(TEXT("1394"))) == 0)
-                                                                {
-                                                                    //Parent buffer already contains the vendor ID as part of the buffer where a full WWN is reported...we just need first 6 bytes. example, brackets added for clarity: 1394\Maxtor&5000DV__v1.00.00\[0010B9]20003D9D6E
-                                                                    //DEVPKEY_Device_CompatibleIds gets use 1394 specifier ID for the device instance
-                                                                    //DEVPKEY_Device_CompatibleIds gets revision and specifier ID for the parent instance: 1394\<specifier>&<revision>
-                                                                    //DEVPKEY_Device_ConfigurationId gets revision and specifier ID for parent instance: sbp2.inf:1394\609E&10483,sbp2_install
-                                                                    //NOTE: There is no currently known way to get the product ID for this interface
-                                                                    ULONG propertyBufLen = 0;
-                                                                    DEVPROPTYPE propertyType = 0;
-                                                                    const DEVPROPKEY *propertyKey = &DEVPKEY_Device_CompatibleIds;
-                                                                    //scan parentBuffer to get vendor
-                                                                    TCHAR *nextToken = NULL;
-                                                                    TCHAR *token = _tcstok_s(parentBuffer, TEXT("\\"), &nextToken);
-                                                                    while (token && nextToken &&  _tcsclen(nextToken) > 0)
-                                                                    {
-                                                                        token = _tcstok_s(NULL, TEXT("\\"), &nextToken);
-                                                                    }
-                                                                    if (token)
-                                                                    {
-                                                                        //at this point, the token contains only the part we care about reading
-                                                                        //We need the first 6 characters to convert into hex for the vendor ID
-                                                                        TCHAR vendorIDString[7] = { 0 };
-                                                                        _tcsncpy_s(vendorIDString, 7 * sizeof(TCHAR), token, 6);
-                                                                        _tprintf(TEXT("%s\n"), vendorIDString);
-        #if defined (_MSC_VER) && _MSC_VER  < SEA_MSC_VER_VS2015
-                                                                        //This is a hack around how VS2013 handles string concatenation with how the printf format macros were defined for it versus newer versions.
-                                                                        int result = _stscanf(token, TEXT("%06lx"), &device->drive_info.adapter_info.vendorID);
-        #else
-                                                                        int result = _stscanf(token, TEXT("%06") TEXT(SCNx32), &device->drive_info.adapter_info.vendorID);
-        #endif
-                                                                
-                                                                        if (result == 1)
-                                                                        {
-                                                                            device->drive_info.adapter_info.vendorIDValid = true;
-                                                                        }
-                                                                    }
 
-                                                                    device->drive_info.adapter_info.infoType = ADAPTER_INFO_IEEE1394;
-                                                                    cmRet = CM_Get_DevNode_PropertyW(parentInst, propertyKey, &propertyType, NULL, &propertyBufLen, 0);
-                                                                    if (CR_SUCCESS == cmRet || CR_INVALID_POINTER == cmRet || CR_BUFFER_SMALL == cmRet)//We'll probably get an invalid pointer or small buffer, but this will return the size of the buffer we need, so allow it through - TJE
+                                                                //For driver name and version data, request the following with the parent's instance. (don't need parent's parent)
+                                                                // 1. DEVPKEY_Device_Service <- gives the driver's name
+                                                                // 2. DEVPKEY_Device_DriverVersion
+                                                                //Both return strings that we can parse as needed. DEVPKEY_Device_DriverDesc gives the driver's "displayable" name, which is not always helpful since it's usually marketting crap
+                                                                ULONG propertyBufLen = 0;
+                                                                DEVPROPTYPE propertyType = 0;
+                                                                cmRet = CM_Get_DevNode_PropertyW(parentInst, &DEVPKEY_Device_Service, &propertyType, M_NULLPTR, &propertyBufLen, 0);
+                                                                if (CR_SUCCESS == cmRet || CR_INVALID_POINTER == cmRet || CR_BUFFER_SMALL == cmRet)//We'll probably get an invalid pointer or small buffer, but this will return the size of the buffer we need, so allow it through - TJE
+                                                                {
+                                                                    PBYTE propertyBuf = C_CAST(PBYTE, safe_calloc(propertyBufLen + 1, sizeof(BYTE)));
+                                                                    if (propertyBuf)
                                                                     {
-                                                                        PBYTE propertyBuf = C_CAST(PBYTE, calloc(propertyBufLen + 1, sizeof(BYTE)));
-                                                                        if (propertyBuf)
+                                                                        propertyBufLen += 1;
+                                                                        cmRet = CM_Get_DevNode_PropertyW(parentInst, &DEVPKEY_Device_Service, &propertyType, propertyBuf, &propertyBufLen, 0);
+                                                                        if (CR_SUCCESS == cmRet)
                                                                         {
-                                                                            propertyBufLen += 1;
-                                                                            if (CR_SUCCESS == CM_Get_DevNode_PropertyW(parentInst, propertyKey, &propertyType, propertyBuf, &propertyBufLen, 0))
+                                                                            DEVPROPTYPE propertyModifier = propertyType & DEVPROP_MASK_TYPEMOD;
+                                                                            uint8_t propListAdditionalLen = propertyModifier == DEVPROP_TYPEMOD_LIST ? 1 : 0;//this adjusts the loop because if this ISN'T set, then we don't need any more length than the string length
+                                                                            for (LPWSTR property = C_CAST(LPWSTR, propertyBuf); *property; property += wcslen(property) + propListAdditionalLen)
                                                                             {
-                                                                                //multiple strings can be returned for some properties. This one will most likely only return one.
-                                                                                for (LPWSTR property = C_CAST(LPWSTR, propertyBuf); *property; property += wcslen(property) + 1)
+                                                                                if (property && (C_CAST(uintptr_t, property) - C_CAST(uintptr_t, propertyBuf)) < propertyBufLen && wcslen(property))
                                                                                 {
-                                                                                    if (property && (C_CAST(uintptr_t, property) - C_CAST(uintptr_t, propertyBuf)) < propertyBufLen && wcslen(property))
-                                                                                    {
-                                                                                        int scannedVals = _snwscanf_s(C_CAST(const wchar_t*, propertyBuf), propertyBufLen, L"1394\\%x&%x", &device->drive_info.adapter_info.specifierID, &device->drive_info.adapter_info.revision);
-                                                                                        if (scannedVals < 2)
-                                                                                        {
-        #if defined (_DEBUG)
-                                                                                            printf("Could not scan all values. Scanned %d values\n", scannedVals);
-        #endif
-                                                                                        }
-                                                                                        else
-                                                                                        {
-                                                                                            device->drive_info.adapter_info.specifierIDValid = true;
-                                                                                            device->drive_info.adapter_info.revisionValid = true;
-                                                                                            break;
-                                                                                        }
-                                                                                    }
+                                                                                    snprintf(device->drive_info.driver_info.driverName, MAX_DRIVER_NAME, "%ls", property);//this should convert the driver name to ascii string.-TJE
                                                                                 }
                                                                             }
-                                                                            safe_Free(propertyBuf)
                                                                         }
+                                                                        safe_free(&propertyBuf);
+                                                                    }
+                                                                }
+                                                                propertyBufLen = 0;//reset to zero before going into this function to read the string again.-TJE
+                                                                cmRet = CM_Get_DevNode_PropertyW(parentInst, &DEVPKEY_Device_DriverVersion, &propertyType, M_NULLPTR, &propertyBufLen, 0);
+                                                                if (CR_SUCCESS == cmRet || CR_INVALID_POINTER == cmRet || CR_BUFFER_SMALL == cmRet)//We'll probably get an invalid pointer or small buffer, but this will return the size of the buffer we need, so allow it through - TJE
+                                                                {
+                                                                    PBYTE propertyBuf = C_CAST(PBYTE, safe_calloc(propertyBufLen + 1, sizeof(BYTE)));
+                                                                    if (propertyBuf)
+                                                                    {
+                                                                        propertyBufLen += 1;
+                                                                        cmRet = CM_Get_DevNode_PropertyW(parentInst, &DEVPKEY_Device_DriverVersion, &propertyType, propertyBuf, &propertyBufLen, 0);
+                                                                        if (CR_SUCCESS == cmRet)
+                                                                        {
+                                                                            DEVPROPTYPE propertyModifier = propertyType & DEVPROP_MASK_TYPEMOD;
+                                                                            uint8_t propListAdditionalLen = propertyModifier == DEVPROP_TYPEMOD_LIST ? 1 : 0;//this adjusts the loop because if this ISN'T set, then we don't need any more length than the string length
+                                                                            for (LPWSTR property = C_CAST(LPWSTR, propertyBuf); *property; property += wcslen(property) + propListAdditionalLen)
+                                                                            {
+                                                                                if (property && (C_CAST(uintptr_t, property) - C_CAST(uintptr_t, propertyBuf)) < propertyBufLen && wcslen(property))
+                                                                                {
+                                                                                    snprintf(device->drive_info.driver_info.driverVersionString, MAX_DRIVER_VER_STR, "%ls", property);
+                                                                                    int scanfRet = swscanf(property, L"%u.%u.%u.%u", &device->drive_info.driver_info.driverMajorVersion, &device->drive_info.driver_info.driverMinorVersion, &device->drive_info.driver_info.driverRevision, &device->drive_info.driver_info.driverBuildNumber);
+                                                                                    if (scanfRet < 4 || scanfRet == EOF)
+                                                                                    {
+                                                                                        printf("Fatal error getting driver version!\n");
+                                                                                    }
+                                                                                    device->drive_info.driver_info.majorVerValid = true;
+                                                                                    device->drive_info.driver_info.minorVerValid = true;
+                                                                                    device->drive_info.driver_info.revisionVerValid = true;
+                                                                                    device->drive_info.driver_info.buildVerValid = true;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        safe_free(&propertyBuf);
                                                                     }
                                                                 }
                                                             }
-                                                            safe_Free(parentBuffer)
+                                                            safe_free(&parentBuffer);
                                                         }
                                                     }
                                                 }
@@ -1967,7 +2092,7 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                                     }
                                 }
                             }
-                            safe_Free(interfaceList)
+                            safe_free(&interfaceList);
                         }
                     }
                 }//else node is not available most likely...possibly not attached to the system.
@@ -1977,18 +2102,20 @@ static int get_Adapter_IDs(tDevice *device, PSTORAGE_DEVICE_DESCRIPTOR deviceDes
                 ret = SUCCESS;
             }
         }
-        safe_Free(listBuffer)
+        safe_free(&listBuffer);
     }
     return ret;
 }
 
-static int win_Get_SCSI_Address(HANDLE deviceHandle, PSCSI_ADDRESS scsiAddress)
+static eReturnValues win_Get_SCSI_Address(HANDLE deviceHandle, PSCSI_ADDRESS scsiAddress)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     if (scsiAddress && deviceHandle != INVALID_HANDLE_VALUE)
     {
         DWORD returnedBytes = 0;
-        BOOL result = DeviceIoControl(deviceHandle, IOCTL_SCSI_GET_ADDRESS, NULL, 0, scsiAddress, sizeof(SCSI_ADDRESS), &returnedBytes, NULL);
+        BOOL result = FALSE;
+        memset(scsiAddress, 0, sizeof(SCSI_ADDRESS));
+        result = DeviceIoControl(deviceHandle, IOCTL_SCSI_GET_ADDRESS, M_NULLPTR, 0, scsiAddress, sizeof(SCSI_ADDRESS), &returnedBytes, M_NULLPTR);
         if (!result)
         {
             scsiAddress->PortNumber = UINT8_MAX;
@@ -2005,8 +2132,10 @@ static int win_Get_SCSI_Address(HANDLE deviceHandle, PSCSI_ADDRESS scsiAddress)
     return ret;
 }
 
-#if WINVER >= SEA_WIN32_WINNT_WINBLUE
+#define WIN_DUMMY_NVME_STATUS(sct, sc) \
+    C_CAST(uint32_t, (sct << 25) | (sc << 17))
 
+#if WINVER >= SEA_WIN32_WINNT_WINBLUE && defined(IOCTL_SCSI_MINIPORT_FIRMWARE)
 static void print_Firmware_Miniport_SRB_Status(ULONG returnCode)
 {
     switch (returnCode)
@@ -2079,12 +2208,12 @@ static void print_Firmware_Miniport_SRB_Status(ULONG returnCode)
 
 //this in an internal function so that it can be reused for reading firmware slot info, sending a download command, or sending an activate command.
 //The inputs
-static int send_Win_Firmware_Miniport_Command(HANDLE deviceHandle, eVerbosityLevels verboseLevel, void* ptrDataRequest, uint32_t dataRequestLength, uint32_t timeoutSeconds, uint32_t firmwareFunction, uint32_t firmwareFlags, uint32_t* returnCode, unsigned int* lastError, uint64_t *timeNanoseconds)
+static eReturnValues send_Win_Firmware_Miniport_Command(HANDLE deviceHandle, eVerbosityLevels verboseLevel, void* ptrDataRequest, uint32_t dataRequestLength, uint32_t timeoutSeconds, uint32_t firmwareFunction, uint32_t firmwareFlags, uint32_t* returnCode, unsigned int* lastError, uint64_t *timeNanoseconds)
 {
-    int ret = OS_PASSTHROUGH_FAILURE;
-    PSRB_IO_CONTROL         srbControl = NULL;
-    PFIRMWARE_REQUEST_BLOCK firmwareRequest = NULL;
-    PUCHAR                  buffer = NULL;
+    eReturnValues ret = OS_PASSTHROUGH_FAILURE;
+    PSRB_IO_CONTROL         srbControl = M_NULLPTR;
+    PFIRMWARE_REQUEST_BLOCK firmwareRequest = M_NULLPTR;
+    PUCHAR                  buffer = M_NULLPTR;
     ULONG                   bufferSize = sizeof(SRB_IO_CONTROL) + sizeof(FIRMWARE_REQUEST_BLOCK);// ((sizeof(SRB_IO_CONTROL) + sizeof(FIRMWARE_REQUEST_BLOCK) - 1) / sizeof(PVOID) + 1) * sizeof(PVOID);//Right from MSFT example toi align the data buffer on pointer alignment - TJE
     ULONG                   firmwareRequestDataOffset = bufferSize;//This must be before we add any additional length to buffersize since this is where data will be copied to for the request - TJE
 
@@ -2097,7 +2226,7 @@ static int send_Win_Firmware_Miniport_Command(HANDLE deviceHandle, eVerbosityLev
         return OS_TIMEOUT_TOO_LARGE;
     }
     bufferSize += dataRequestLength;//Add the length of the passed in request that will be issued.
-    buffer = C_CAST(PUCHAR, calloc_aligned(bufferSize, sizeof(UCHAR), sizeof(PVOID)));//Most of the info I can find seems to want this pointer aligned, so this should work - TJE
+    buffer = C_CAST(PUCHAR, safe_calloc_aligned(bufferSize, sizeof(UCHAR), sizeof(PVOID)));//Most of the info I can find seems to want this pointer aligned, so this should work - TJE
     if (!buffer)
     {
         return MEMORY_FAILURE;
@@ -2138,10 +2267,10 @@ static int send_Win_Firmware_Miniport_Command(HANDLE deviceHandle, eVerbosityLev
     ULONG returnedLength = 0;
     OVERLAPPED overlappedStruct;
     memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-    overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (overlappedStruct.hEvent == NULL)
+    overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
+    if (overlappedStruct.hEvent == M_NULLPTR)
     {
-        safe_Free_aligned(buffer);
+        safe_free_aligned(&buffer);
         return OS_PASSTHROUGH_FAILURE;
     }
     SetLastError(ERROR_SUCCESS);
@@ -2158,7 +2287,7 @@ static int send_Win_Firmware_Miniport_Command(HANDLE deviceHandle, eVerbosityLev
     }
     stop_Timer(&commandTimer);
     CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-    overlappedStruct.hEvent = NULL;
+    overlappedStruct.hEvent = M_NULLPTR;
 
     if (timeNanoseconds)
     {
@@ -2181,7 +2310,7 @@ static int send_Win_Firmware_Miniport_Command(HANDLE deviceHandle, eVerbosityLev
         if (VERBOSITY_COMMAND_VERBOSE <= verboseLevel)
         {
             printf("Firmware Miniport Status: ");
-            print_Firmware_Miniport_SRB_Status(getLastError);
+            print_Firmware_Miniport_SRB_Status(srbControl->ReturnCode);
         }
     }
     else
@@ -2192,26 +2321,26 @@ static int send_Win_Firmware_Miniport_Command(HANDLE deviceHandle, eVerbosityLev
             printf("Windows Error: ");
             print_Windows_Error_To_Screen(getLastError);
             printf("Firmware Miniport Status: ");
-            print_Firmware_Miniport_SRB_Status(getLastError);
+            print_Firmware_Miniport_SRB_Status(srbControl->ReturnCode);
         }
     }
     if (lastError)
     {
         *lastError = getLastError;
     }
-    safe_Free_aligned(buffer);
+    safe_free_aligned(&buffer);
     return ret;
 }
 
-static int get_Win_FWDL_Miniport_Capabilities(tDevice* device, bool controllerRequest)
+static eReturnValues get_Win_FWDL_Miniport_Capabilities(tDevice* device, bool controllerRequest)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
 #if WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_THRESHOLD
     if (is_Windows_10_Or_Higher())
     {
         //V2 structures - Win10 and up
         ULONG firmwareInfoLength = sizeof(STORAGE_FIRMWARE_INFO_V2) + (sizeof(STORAGE_FIRMWARE_SLOT_INFO_V2) * 7);//max of 7 slots in NVMe. This should be plenty of space regardless of device type -TJE
-        PSTORAGE_FIRMWARE_INFO_V2 firmwareInfo = C_CAST(PSTORAGE_FIRMWARE_INFO_V2, calloc(firmwareInfoLength, sizeof(UCHAR)));
+        PSTORAGE_FIRMWARE_INFO_V2 firmwareInfo = C_CAST(PSTORAGE_FIRMWARE_INFO_V2, safe_calloc(firmwareInfoLength, sizeof(UCHAR)));
         if (firmwareInfo)
         {
             uint32_t returnCode = 0;
@@ -2219,14 +2348,13 @@ static int get_Win_FWDL_Miniport_Capabilities(tDevice* device, bool controllerRe
             firmwareInfo->Version = STORAGE_FIRMWARE_INFO_STRUCTURE_VERSION_V2;
             firmwareInfo->Size = sizeof(STORAGE_FIRMWARE_INFO_V2);
             //Issue the minport IOCTL
-            ret = send_Win_Firmware_Miniport_Command(device->os_info.fd, device->deviceVerbosity, firmwareInfo, firmwareInfoLength, 15, FIRMWARE_FUNCTION_GET_INFO, controllerRequest ? FIRMWARE_REQUEST_FLAG_CONTROLLER : 0, &returnCode, &device->os_info.last_error, NULL);
+            ret = send_Win_Firmware_Miniport_Command(device->os_info.fd, device->deviceVerbosity, firmwareInfo, firmwareInfoLength, 15, FIRMWARE_FUNCTION_GET_INFO, controllerRequest ? FIRMWARE_REQUEST_FLAG_CONTROLLER : 0, &returnCode, &device->os_info.last_error, M_NULLPTR);
             if (ret == SUCCESS)
             {
                 device->os_info.fwdlMiniportSupported = true;
                 device->os_info.fwdlIOsupport.fwdlIOSupported = firmwareInfo->UpgradeSupport;
                 device->os_info.fwdlIOsupport.payloadAlignment = firmwareInfo->ImagePayloadAlignment;
                 device->os_info.fwdlIOsupport.maxXferSize = firmwareInfo->ImagePayloadMaxSize;
-                //TODO: store more FWDL information as we need it
 #if defined (_DEBUG)
                 printf("Got Miniport V2 FWDL Info\n");
                 printf("\tSupported: %d\n", firmwareInfo->UpgradeSupport);
@@ -2245,7 +2373,7 @@ static int get_Win_FWDL_Miniport_Capabilities(tDevice* device, bool controllerRe
                 }
 #endif
             }
-            safe_Free(firmwareInfo);
+            safe_free(&firmwareInfo);
         }
         else
         {
@@ -2258,7 +2386,7 @@ static int get_Win_FWDL_Miniport_Capabilities(tDevice* device, bool controllerRe
     {
         //V1 structures - Win 8.1
         ULONG firmwareInfoLength = sizeof(STORAGE_FIRMWARE_INFO) + (sizeof(STORAGE_FIRMWARE_SLOT_INFO) * 7);//max of 7 slots in NVMe. This should be plenty of space regardless of device type -TJE
-        PSTORAGE_FIRMWARE_INFO firmwareInfo = C_CAST(PSTORAGE_FIRMWARE_INFO, calloc(firmwareInfoLength, sizeof(UCHAR)));
+        PSTORAGE_FIRMWARE_INFO firmwareInfo = C_CAST(PSTORAGE_FIRMWARE_INFO, safe_calloc(firmwareInfoLength, sizeof(UCHAR)));
         if (firmwareInfo)
         {
             uint32_t returnCode = 0;
@@ -2266,7 +2394,7 @@ static int get_Win_FWDL_Miniport_Capabilities(tDevice* device, bool controllerRe
             firmwareInfo->Version = STORAGE_FIRMWARE_INFO_STRUCTURE_VERSION;
             firmwareInfo->Size = sizeof(STORAGE_FIRMWARE_INFO);
             //Issue the minport IOCTL
-            ret = send_Win_Firmware_Miniport_Command(device->os_info.fd, device->deviceVerbosity, firmwareInfo, firmwareInfoLength, 15, FIRMWARE_FUNCTION_GET_INFO, controllerRequest ? FIRMWARE_REQUEST_FLAG_CONTROLLER : 0, &returnCode, &device->os_info.last_error, NULL);
+            ret = send_Win_Firmware_Miniport_Command(device->os_info.fd, device->deviceVerbosity, firmwareInfo, firmwareInfoLength, 15, FIRMWARE_FUNCTION_GET_INFO, controllerRequest ? FIRMWARE_REQUEST_FLAG_CONTROLLER : 0, &returnCode, &device->os_info.last_error, M_NULLPTR);
             
             if (ret == SUCCESS)
             {
@@ -2274,7 +2402,6 @@ static int get_Win_FWDL_Miniport_Capabilities(tDevice* device, bool controllerRe
                 device->os_info.fwdlIOsupport.fwdlIOSupported = firmwareInfo->UpgradeSupport;
                 device->os_info.fwdlIOsupport.payloadAlignment = 4096;//This is not specified in Win8, but assume this!
                 device->os_info.fwdlIOsupport.maxXferSize = device->os_info.adapterMaxTransferSize > 0 ? device->os_info.adapterMaxTransferSize : 65536; //Set 64K in case this is not otherwise set...not great but will likely work since this is the common transfer size limit in Windows - TJE
-                //TODO: store more FWDL information as we need it
 #if defined (_DEBUG)
                 printf("Got Miniport V1 FWDL Info\n");
                 printf("\tSupported: %d\n", firmwareInfo->UpgradeSupport);
@@ -2287,7 +2414,7 @@ static int get_Win_FWDL_Miniport_Capabilities(tDevice* device, bool controllerRe
                 //print out what's in the slots!
                 for (uint8_t iter = 0; iter < firmwareInfo->SlotCount && iter < 7; ++iter)
                 {
-                    char v1Revision[9] = { 0 };
+                    DECLARE_ZERO_INIT_ARRAY(char, v1Revision, 9);
                     snprintf(v1Revision, 9, "%s", firmwareInfo->Slot[iter].Revision.Info);
                     printf("\t    Firmware Slot %d:\n", firmwareInfo->Slot[iter].SlotNumber);
                     printf("\t\tRead Only: %d\n", firmwareInfo->Slot[iter].ReadOnly);
@@ -2295,7 +2422,7 @@ static int get_Win_FWDL_Miniport_Capabilities(tDevice* device, bool controllerRe
                 }
 #endif
             }
-            safe_Free(firmwareInfo);
+            safe_free(&firmwareInfo);
         }
         else
         {
@@ -2332,7 +2459,7 @@ NOTE: Some SAS HBAs will issue a readlogext command before each download command
 
 */
 
-bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx* scsiIoCtx)//TODO: add nvme support
+bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx* scsiIoCtx)
 {
 #if defined (_DEBUG_FWDL_API_COMPATABILITY)
     printf("Checking if FWDL Command is compatible with Win 10 API\n");
@@ -2373,7 +2500,7 @@ bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx* scsiIoCtx)/
                 isActivate = true;
             }
         }
-        else if (scsiIoCtx->pAtaCmdOpts && (scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE || scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_DMA))
+        else if (scsiIoCtx->pAtaCmdOpts && (scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_CMD || scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_DMA))
         {
 
             if (scsiIoCtx->pAtaCmdOpts->tfr.ErrorFeature == 0x0E)
@@ -2417,7 +2544,7 @@ bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx* scsiIoCtx)/
         printf("Checking ATA command info for FWDL support\n");
 #endif
         //We're sending an ATA passthrough command, and the OS says the io is supported, so it SHOULD work. - TJE
-        if (scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE || scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_DMA)
+        if (scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_CMD || scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_DMA)
         {
 #if defined (_DEBUG_FWDL_API_COMPATABILITY)
             printf("Is Download Microcode command (%" PRIX8 "h)\n", scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus);
@@ -2456,7 +2583,7 @@ bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx* scsiIoCtx)/
 #if defined (_DEBUG_FWDL_API_COMPATABILITY)
         printf("Checking SCSI command info for FWDL Support\n");
 #endif
-        //TODO? Should we check that this is a SCSI Drive? Right now we'll just attempt the download and let the drive/SATL handle translation
+        //Should we check that this is a SCSI Drive? Right now we'll just attempt the download and let the drive/SATL handle translation
         //check that it's a write buffer command for a firmware download & it's a deferred download command since that is all that is supported
         if (scsiIoCtx->cdb[OPERATION_CODE] == WRITE_BUFFER_CMD)
         {
@@ -2492,7 +2619,7 @@ bool is_Firmware_Download_Command_Compatible_With_Win_API(ScsiIoCtx* scsiIoCtx)/
 static bool is_Activate_Command(ScsiIoCtx* scsiIoCtx)
 {
     bool isActivate = false;
-    if (scsiIoCtx->pAtaCmdOpts && (scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE || scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_DMA))
+    if (scsiIoCtx->pAtaCmdOpts && (scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_CMD || scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_DOWNLOAD_MICROCODE_DMA))
     {
         //check the subcommand (feature)
         if (scsiIoCtx->pAtaCmdOpts->tfr.ErrorFeature == 0x0F)
@@ -2516,11 +2643,11 @@ static bool is_Activate_Command(ScsiIoCtx* scsiIoCtx)
     return isActivate;
 }
 
-static int dummy_Up_SCSI_Sense_FWDL(ScsiIoCtx* scsiIoCtx, ULONG returnCode)
+static eReturnValues dummy_Up_SCSI_Sense_FWDL(ScsiIoCtx* scsiIoCtx, ULONG returnCode)
 {
-    int ret = SUCCESS;//assume this for anything where we could generate a usable status and a few other cases
+    eReturnValues ret = SUCCESS;//assume this for anything where we could generate a usable status and a few other cases
     uint8_t senseKey = SENSE_KEY_NO_ERROR, asc = 0, ascq = 0;//no fru since that is vendor unique info that we have no way of dummying up - TJE
-    uint8_t localSense[SPC3_SENSE_LEN] = { 0 };
+    DECLARE_ZERO_INIT_ARRAY(uint8_t, localSense, SPC3_SENSE_LEN);
     if (scsiIoCtx->pAtaCmdOpts)
     {
         //sense code should be "ATA Passthrough information available" since this is how a passed ATA command will show up versus a SCSI command - TJE
@@ -2551,7 +2678,6 @@ static int dummy_Up_SCSI_Sense_FWDL(ScsiIoCtx* scsiIoCtx, ULONG returnCode)
         case FIRMWARE_STATUS_DEVICE_ERROR:
         case FIRMWARE_STATUS_CONTROLLER_ERROR:
             scsiIoCtx->pAtaCmdOpts->rtfr.status = ATA_STATUS_BIT_SEEK_COMPLETE | ATA_STATUS_BIT_READY | ATA_STATUS_BIT_DEVICE_FAULT;
-            //TODO: Error register? Not sure what gets set in a device fault situation - TJE
             break;
         case FIRMWARE_STATUS_ERROR:
         case FIRMWARE_STATUS_INVALID_SLOT:
@@ -2721,15 +2847,15 @@ static int dummy_Up_SCSI_Sense_FWDL(ScsiIoCtx* scsiIoCtx, ULONG returnCode)
     return ret;
 }
 
-static int win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
+static eReturnValues win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
 #if WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_THRESHOLD
     if (is_Windows_10_Or_Higher())
     {
         //V2 structures - Win10 and up
         ULONG firmwareDLLength = sizeof(STORAGE_FIRMWARE_DOWNLOAD_V2) + scsiIoCtx->dataLength;
-        PSTORAGE_FIRMWARE_DOWNLOAD_V2 firmwareDownload = C_CAST(PSTORAGE_FIRMWARE_DOWNLOAD_V2, calloc(firmwareDLLength, sizeof(UCHAR)));
+        PSTORAGE_FIRMWARE_DOWNLOAD_V2 firmwareDownload = C_CAST(PSTORAGE_FIRMWARE_DOWNLOAD_V2, safe_calloc(firmwareDLLength, sizeof(UCHAR)));
         if (firmwareDownload)
         {
             uint32_t returnCode = 0;
@@ -2742,12 +2868,12 @@ static int win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
             firmwareDownload->BufferSize = firmwareDownload->ImageSize = scsiIoCtx->dataLength;
 
             //we need to set the offset since MS uses this in the command sent to the device.
-            firmwareDownload->Offset = 0;//TODO: Make sure this works even though the buffer pointer is only the current segment!
+            firmwareDownload->Offset = 0;
             if (scsiIoCtx && scsiIoCtx->pAtaCmdOpts)
             {
                 //get offset from the tfrs
                 firmwareDownload->Offset = C_CAST(DWORDLONG, M_BytesTo2ByteValue(scsiIoCtx->pAtaCmdOpts->tfr.LbaHi, scsiIoCtx->pAtaCmdOpts->tfr.LbaMid)) * LEGACY_DRIVE_SEC_SIZE;
-                firmwareDownload->BufferSize = firmwareDownload->ImageSize = C_CAST(DWORDLONG, M_BytesTo2ByteValue(scsiIoCtx->pAtaCmdOpts->tfr.SectorCount, scsiIoCtx->pAtaCmdOpts->tfr.LbaLow)) * LEGACY_DRIVE_SEC_SIZE;;
+                firmwareDownload->BufferSize = firmwareDownload->ImageSize = C_CAST(DWORDLONG, M_BytesTo2ByteValue(scsiIoCtx->pAtaCmdOpts->tfr.SectorCount, scsiIoCtx->pAtaCmdOpts->tfr.LbaLow)) * C_CAST(DWORDLONG, LEGACY_DRIVE_SEC_SIZE);
             }
             else if (scsiIoCtx)
             {
@@ -2758,8 +2884,8 @@ static int win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
             }
             else
             {
-                safe_Free(firmwareDownload)
-                    return BAD_PARAMETER;
+                safe_free(&firmwareDownload);
+                return BAD_PARAMETER;
             }
 
 
@@ -2786,7 +2912,7 @@ static int win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
             {
                 ret = dummy_Up_SCSI_Sense_FWDL(scsiIoCtx, returnCode);
             }
-            safe_Free(firmwareDownload);
+            safe_free(&firmwareDownload);
         }
         else
         {
@@ -2799,7 +2925,7 @@ static int win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
         {
             //V1 structures - Win8.1
             ULONG firmwareDLLength = sizeof(STORAGE_FIRMWARE_DOWNLOAD) + scsiIoCtx->dataLength;
-            PSTORAGE_FIRMWARE_DOWNLOAD firmwareDownload = C_CAST(PSTORAGE_FIRMWARE_DOWNLOAD, calloc(firmwareDLLength, sizeof(UCHAR)));
+            PSTORAGE_FIRMWARE_DOWNLOAD firmwareDownload = C_CAST(PSTORAGE_FIRMWARE_DOWNLOAD, safe_calloc(firmwareDLLength, sizeof(UCHAR)));
             if (firmwareDownload)
             {
                 uint32_t returnCode = 0;
@@ -2810,12 +2936,12 @@ static int win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
                 firmwareDownload->BufferSize = scsiIoCtx->dataLength;
 
                 //we need to set the offset since MS uses this in the command sent to the device.
-                firmwareDownload->Offset = 0;//TODO: Make sure this works even though the buffer pointer is only the current segment!
+                firmwareDownload->Offset = 0;
                 if (scsiIoCtx && scsiIoCtx->pAtaCmdOpts)
                 {
                     //get offset from the tfrs
                     firmwareDownload->Offset = C_CAST(DWORDLONG, M_BytesTo2ByteValue(scsiIoCtx->pAtaCmdOpts->tfr.LbaHi, scsiIoCtx->pAtaCmdOpts->tfr.LbaMid)) * LEGACY_DRIVE_SEC_SIZE;
-                    firmwareDownload->BufferSize = C_CAST(DWORDLONG, M_BytesTo2ByteValue(scsiIoCtx->pAtaCmdOpts->tfr.SectorCount, scsiIoCtx->pAtaCmdOpts->tfr.LbaLow)) * LEGACY_DRIVE_SEC_SIZE;;
+                    firmwareDownload->BufferSize = C_CAST(DWORDLONG, M_BytesTo2ByteValue(scsiIoCtx->pAtaCmdOpts->tfr.SectorCount, scsiIoCtx->pAtaCmdOpts->tfr.LbaLow)) * LEGACY_DRIVE_SEC_SIZE;
                 }
                 else if (scsiIoCtx)
                 {
@@ -2825,7 +2951,7 @@ static int win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
                 }
                 else
                 {
-                    safe_Free(firmwareDownload)
+                    safe_free(&firmwareDownload);
                     return BAD_PARAMETER;
                 }
 
@@ -2838,7 +2964,7 @@ static int win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
                 {
                     ret = dummy_Up_SCSI_Sense_FWDL(scsiIoCtx, returnCode);
                 }
-                safe_Free(firmwareDownload);
+                safe_free(&firmwareDownload);
             }
             else
             {
@@ -2848,30 +2974,34 @@ static int win_FW_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
     return ret;
 }
 
-static int win_FW_Activate_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
+static eReturnValues win_FW_Activate_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
+    if (scsiIoCtx == M_NULLPTR)
+    {
+        return BAD_PARAMETER;
+    }
     //Only one version of activate structure - TJE
     if (is_Windows_8_One_Or_Higher())
     {
         //V1 structures - Win8.1 & Win10
         ULONG firmwareActivateLength = sizeof(STORAGE_FIRMWARE_ACTIVATE);
-        PSTORAGE_FIRMWARE_ACTIVATE firmwareActivate = C_CAST(PSTORAGE_FIRMWARE_ACTIVATE, calloc(firmwareActivateLength, sizeof(UCHAR)));
+        PSTORAGE_FIRMWARE_ACTIVATE firmwareActivate = C_CAST(PSTORAGE_FIRMWARE_ACTIVATE, safe_calloc(firmwareActivateLength, sizeof(UCHAR)));
         if (firmwareActivate)
         {
             uint32_t returnCode = 0;
             uint32_t fwdlFlags = 0;//start with this, but may need other flags
-            
+
             //Setup input values
             firmwareActivate->Version = STORAGE_FIRMWARE_ACTIVATE_STRUCTURE_VERSION;
             firmwareActivate->Size = sizeof(STORAGE_FIRMWARE_ACTIVATE);
             firmwareActivate->SlotToActivate = 0;
 
-            if (scsiIoCtx && !scsiIoCtx->pAtaCmdOpts)
+            if (scsiIoCtx->pAtaCmdOpts == M_NULLPTR)
             {
                 firmwareActivate->SlotToActivate = scsiIoCtx->cdb[2];//Set the slot number to the buffer ID number...This is the closest this translates.
             }
-            if (scsiIoCtx->device->drive_info.interface_type == NVME_INTERFACE)//TODO: SCSI interface, but NVMe in 8.1 will likely only be identified by earlier bustype or vendor id
+            if (scsiIoCtx->device->drive_info.interface_type == NVME_INTERFACE)//SCSI interface, but NVMe in 8.1 will likely only be identified by earlier bustype or vendor id
             {
                 //if we are on NVMe, but the command comes to here, then someone forced SCSI mode, so let's set this flag correctly
                 fwdlFlags |= STORAGE_HW_FIRMWARE_REQUEST_FLAG_CONTROLLER;
@@ -2883,7 +3013,7 @@ static int win_FW_Activate_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
             {
                 ret = dummy_Up_SCSI_Sense_FWDL(scsiIoCtx, returnCode);
             }
-            safe_Free(firmwareActivate);
+            safe_free(&firmwareActivate);
         }
         else
         {
@@ -2893,7 +3023,7 @@ static int win_FW_Activate_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
     return ret;
 }
 
-static int windows_Firmware_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
+static eReturnValues windows_Firmware_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
 {
     if (!scsiIoCtx)
     {
@@ -2909,15 +3039,10 @@ static int windows_Firmware_Download_IO_SCSI_Miniport(ScsiIoCtx* scsiIoCtx)
     }
 }
 
-#if !defined (DISABLE_NVME_PASSTHROUGH)
-
-#define WIN_DUMMY_NVME_STATUS(sct, sc) \
-    C_CAST(uint32_t, (sct << 25) | (sc << 17))
-
-//TODO: This may need adjusting with bus trace help in the future, but for now this is a best guess from what info we have.-TJE
-static int dummy_Up_NVM_Status_FWDL(nvmeCmdCtx* nvmeIoCtx, ULONG returnCode)
+//This may need adjusting with bus trace help in the future, but for now this is a best guess from what info we have.-TJE
+static eReturnValues dummy_Up_NVM_Status_FWDL(nvmeCmdCtx* nvmeIoCtx, ULONG returnCode)
 {
-    int ret = SUCCESS;//assume this for anything where we could generate a usable status and a few other cases
+    eReturnValues ret = SUCCESS;//assume this for anything where we could generate a usable status and a few other cases
     switch (returnCode)
     {
     case FIRMWARE_STATUS_SUCCESS:
@@ -2946,7 +3071,7 @@ static int dummy_Up_NVM_Status_FWDL(nvmeCmdCtx* nvmeIoCtx, ULONG returnCode)
         break;
     case FIRMWARE_STATUS_INVALID_IMAGE:
         nvmeIoCtx->commandCompletionData.dw3Valid = true;
-        nvmeIoCtx->commandCompletionData.dw3 = WIN_DUMMY_NVME_STATUS(NVME_SCT_COMMAND_SPECIFIC_STATUS, 7);;
+        nvmeIoCtx->commandCompletionData.dw3 = WIN_DUMMY_NVME_STATUS(NVME_SCT_COMMAND_SPECIFIC_STATUS, 7);
         break;
     case FIRMWARE_STATUS_DEVICE_ERROR:
     case FIRMWARE_STATUS_CONTROLLER_ERROR:
@@ -2954,6 +3079,7 @@ static int dummy_Up_NVM_Status_FWDL(nvmeCmdCtx* nvmeIoCtx, ULONG returnCode)
         nvmeIoCtx->commandCompletionData.dw3 = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, 6);//internal error
         break;
     case FIRMWARE_STATUS_POWER_CYCLE_REQUIRED:
+        ret = POWER_CYCLE_REQUIRED;
         break;
 #if WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_15063
     case FIRMWARE_STATUS_INTERFACE_CRC_ERROR:
@@ -2993,15 +3119,15 @@ static int dummy_Up_NVM_Status_FWDL(nvmeCmdCtx* nvmeIoCtx, ULONG returnCode)
     return ret;
 }
 
-static int send_Win_NVME_Firmware_Miniport_Download(nvmeCmdCtx* nvmeIoCtx)
+static eReturnValues send_Win_NVME_Firmware_Miniport_Download(nvmeCmdCtx* nvmeIoCtx)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
 #if WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_THRESHOLD
     if (is_Windows_10_Or_Higher())
     {
         //V2 structures - Win10 and up
         ULONG firmwareDLLength = sizeof(STORAGE_FIRMWARE_DOWNLOAD_V2) + nvmeIoCtx->dataSize;
-        PSTORAGE_FIRMWARE_DOWNLOAD_V2 firmwareDownload = C_CAST(PSTORAGE_FIRMWARE_DOWNLOAD_V2, calloc(firmwareDLLength, sizeof(UCHAR)));
+        PSTORAGE_FIRMWARE_DOWNLOAD_V2 firmwareDownload = C_CAST(PSTORAGE_FIRMWARE_DOWNLOAD_V2, safe_calloc(firmwareDLLength, sizeof(UCHAR)));
         if (firmwareDownload)
         {
             uint32_t returnCode = 0;
@@ -3011,8 +3137,8 @@ static int send_Win_NVME_Firmware_Miniport_Download(nvmeCmdCtx* nvmeIoCtx)
             firmwareDownload->Size = sizeof(STORAGE_FIRMWARE_DOWNLOAD_V2);
             firmwareDownload->Offset = C_CAST(ULONGLONG, nvmeIoCtx->cmd.adminCmd.cdw11) << 2;//multiply by 4 to convert words to bytes
             firmwareDownload->BufferSize = C_CAST(ULONGLONG, nvmeIoCtx->cmd.adminCmd.cdw10 + 1) << 2;//add one since this is zeroes based then multiply by 4 to convert words to bytes
-            firmwareDownload->ImageSize = C_CAST(ULONGLONG, nvmeIoCtx->cmd.adminCmd.cdw10 + 1) << 2;//add one since this is zeroes based then multiply by 4 to convert words to bytes
-            firmwareDownload->Slot = STORAGE_FIRMWARE_INFO_INVALID_SLOT;//TODO: SHould this be zero? It technically shouldn't be used in this command in the NVMe spec - TJE
+            firmwareDownload->ImageSize = C_CAST(ULONG, nvmeIoCtx->cmd.adminCmd.cdw10 + 1) << 2;//add one since this is zeroes based then multiply by 4 to convert words to bytes
+            firmwareDownload->Slot = STORAGE_FIRMWARE_INFO_INVALID_SLOT;//SHould this be zero? It technically shouldn't be used in this command in the NVMe spec - TJE
 
             //copy the image to ImageBuffer
             memcpy(firmwareDownload->ImageBuffer, nvmeIoCtx->ptrData, nvmeIoCtx->dataSize);
@@ -3037,7 +3163,7 @@ static int send_Win_NVME_Firmware_Miniport_Download(nvmeCmdCtx* nvmeIoCtx)
             {
                 ret = dummy_Up_NVM_Status_FWDL(nvmeIoCtx, returnCode);
             }
-            safe_Free(firmwareDownload);
+            safe_free(&firmwareDownload);
         }
         else
         {
@@ -3050,7 +3176,7 @@ static int send_Win_NVME_Firmware_Miniport_Download(nvmeCmdCtx* nvmeIoCtx)
     {
         //V1 structures - Win8.1
         ULONG firmwareDLLength = sizeof(STORAGE_FIRMWARE_DOWNLOAD) + nvmeIoCtx->dataSize;
-        PSTORAGE_FIRMWARE_DOWNLOAD firmwareDownload = C_CAST(PSTORAGE_FIRMWARE_DOWNLOAD, calloc(firmwareDLLength, sizeof(UCHAR)));
+        PSTORAGE_FIRMWARE_DOWNLOAD firmwareDownload = C_CAST(PSTORAGE_FIRMWARE_DOWNLOAD, safe_calloc(firmwareDLLength, sizeof(UCHAR)));
         if (firmwareDownload)
         {
             uint32_t returnCode = 0;
@@ -3070,7 +3196,7 @@ static int send_Win_NVME_Firmware_Miniport_Download(nvmeCmdCtx* nvmeIoCtx)
             {
                 ret = dummy_Up_NVM_Status_FWDL(nvmeIoCtx, returnCode);
             }
-            safe_Free(firmwareDownload);
+            safe_free(&firmwareDownload);
     }
         else
         {
@@ -3080,15 +3206,15 @@ static int send_Win_NVME_Firmware_Miniport_Download(nvmeCmdCtx* nvmeIoCtx)
     return ret;
 }
 
-static int send_Win_NVME_Firmware_Miniport_Activate(nvmeCmdCtx* nvmeIoCtx)
+static eReturnValues send_Win_NVME_Firmware_Miniport_Activate(nvmeCmdCtx* nvmeIoCtx)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
     //Only one version of activate structure - TJE
     if (is_Windows_8_One_Or_Higher())
     {
         //V1 structures - Win8.1 & Win10
         ULONG firmwareActivateLength = sizeof(STORAGE_FIRMWARE_ACTIVATE);
-        PSTORAGE_FIRMWARE_ACTIVATE firmwareActivate = C_CAST(PSTORAGE_FIRMWARE_ACTIVATE, calloc(firmwareActivateLength, sizeof(UCHAR)));
+        PSTORAGE_FIRMWARE_ACTIVATE firmwareActivate = C_CAST(PSTORAGE_FIRMWARE_ACTIVATE, safe_calloc(firmwareActivateLength, sizeof(UCHAR)));
         if (firmwareActivate)
         {
             uint32_t returnCode = 0;
@@ -3104,14 +3230,14 @@ static int send_Win_NVME_Firmware_Miniport_Activate(nvmeCmdCtx* nvmeIoCtx)
                 //Activate action 0 & 1 say to replace a firmware image in a specified slot (and to or not to activate).
                 fwdlFlags |= STORAGE_HW_FIRMWARE_REQUEST_FLAG_SWITCH_TO_EXISTING_FIRMWARE;
             }
-                
+
             //Issue the minport IOCTL
             ret = send_Win_Firmware_Miniport_Command(nvmeIoCtx->device->os_info.fd, nvmeIoCtx->device->deviceVerbosity, firmwareActivate, firmwareActivateLength, nvmeIoCtx->timeout, FIRMWARE_FUNCTION_ACTIVATE, fwdlFlags, &returnCode, &nvmeIoCtx->device->os_info.last_error, &nvmeIoCtx->device->drive_info.lastCommandTimeNanoSeconds);
             if (ret == SUCCESS)
             {
                 ret = dummy_Up_NVM_Status_FWDL(nvmeIoCtx, returnCode);
             }
-            safe_Free(firmwareActivate);
+            safe_free(&firmwareActivate);
         }
         else
         {
@@ -3121,23 +3247,25 @@ static int send_Win_NVME_Firmware_Miniport_Activate(nvmeCmdCtx* nvmeIoCtx)
     return ret;
 }
 
-#endif //DISABLE_NVME_PASSTHROUGH
 #endif //WINVER >= SEA_WIN32_WINNT_WINBLUE
 
-static int get_os_drive_number( char *filename )
-{
-    int  drive_num = -1;
-    char *pdev     = NULL;
-    //char * next_token = NULL;
-    pdev = strrchr(filename, 'e');
-    if (pdev != NULL)
-        drive_num = atoi(pdev + 1);
-    return drive_num;
-}
+//static eReturnValues get_os_drive_number( char *filename )
+//{
+//    int  drive_num = -1;
+//    char *pdev     = M_NULLPTR;
+//    //char * next_token = M_NULLPTR;
+//    pdev = strrchr(filename, 'e');
+//    if (pdev != M_NULLPTR)
+//    {
+//        errno = 0;//ISO secure coding standard recommends this to ensure errno is interpretted correctly after this call
+//        drive_num = strtol(pdev + 1, M_NULLPTR, 0);
+//    }
+//    return drive_num;
+//}
 
-static int close_SCSI_SRB_Handle(tDevice *device)
+static eReturnValues close_SCSI_SRB_Handle(tDevice *device)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     if (device)
     {
         if (device->os_info.scsiSRBHandle != INVALID_HANDLE_VALUE)
@@ -3170,7 +3298,7 @@ static int close_SCSI_SRB_Handle(tDevice *device)
 //!   \return SUCCESS - pass, !SUCCESS fail or something went wrong
 //
 //-----------------------------------------------------------------------------
-int close_Device(tDevice *dev)
+eReturnValues close_Device(tDevice *dev)
 {
     int retValue = 0;
     if (dev)
@@ -3184,7 +3312,8 @@ int close_Device(tDevice *dev)
 #endif
         {
             close_SCSI_SRB_Handle(dev);//\\.\SCSIx: could be opened for different reasons...so we need to close it here.
-            safe_Free(dev->os_info.csmiDeviceData)//CSMI may have been used, so free this memory if it was before we close out.
+            safe_free_csmi_dev_info(&dev->os_info.csmiDeviceData);//CSMI may have been used, so free this memory if it was before we close out.
+            CloseHandle(dev->os_info.forceUnitAccessRWfd);//if FUA handle was opened, this will close it out.
             retValue = CloseHandle(dev->os_info.fd);
             dev->os_info.last_error = GetLastError();
             if (retValue)
@@ -3205,13 +3334,13 @@ int close_Device(tDevice *dev)
 }
 
 //opens this handle, but does nothing else with it
-static int open_SCSI_SRB_Handle(tDevice *device)
+static eReturnValues open_SCSI_SRB_Handle(tDevice *device)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
     if (device->os_info.scsi_addr.PortNumber != 0xFF)
     {
         //open the SCSI SRB handle
-        TCHAR scsiDeviceName[WIN_MAX_DEVICE_NAME_LENGTH] = { 0 };
+        DECLARE_ZERO_INIT_ARRAY(TCHAR, scsiDeviceName, WIN_MAX_DEVICE_NAME_LENGTH);
         TCHAR *ptrSCSIDeviceName = &scsiDeviceName[0];
         _stprintf_s(scsiDeviceName, WIN_MAX_DEVICE_NAME_LENGTH, TEXT("%hs%d:"), WIN_SCSI_SRB, device->os_info.scsi_addr.PortNumber);
         device->os_info.scsiSRBHandle = CreateFile(ptrSCSIDeviceName,
@@ -3222,14 +3351,14 @@ static int open_SCSI_SRB_Handle(tDevice *device)
                please write to developers  -MA */
             GENERIC_WRITE | GENERIC_READ, //FILE_ALL_ACCESS,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL,
+            M_NULLPTR,
             OPEN_EXISTING,
 #if !defined(WINDOWS_DISABLE_OVERLAPPED)
             FILE_FLAG_OVERLAPPED,
 #else
             0,
 #endif
-            NULL);
+            M_NULLPTR);
 
         device->os_info.last_error = GetLastError();
 
@@ -3253,14 +3382,13 @@ static int open_SCSI_SRB_Handle(tDevice *device)
 //Best I can find right now is that this IOCTL is available in XP and up. Change the definition below as needed.
 //Many of the IOCTLs are wrapped for the version of Win API that they appeared in but may not be perfect.
 //Using MSFT's documentation on them as best we can find. - TJE
-//TODO: IOCTL_STORAGE_SET_PROPERTY
 #if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WINXP 
 
 //This is a basic way of getting storage properties and cannot account for some which require additional input parameters
 //Others with additional parameters should be in their own function since the additional parameters will vary!
-static int win_Get_Property_Data(HANDLE deviceHandle, STORAGE_PROPERTY_ID propertyID, void *outputData, DWORD outputDataLength)
+static eReturnValues win_Get_Property_Data(HANDLE deviceHandle, STORAGE_PROPERTY_ID propertyID, void *outputData, DWORD outputDataLength)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     if (outputData)
     {
         STORAGE_PROPERTY_QUERY query;
@@ -3269,7 +3397,7 @@ static int win_Get_Property_Data(HANDLE deviceHandle, STORAGE_PROPERTY_ID proper
         memset(&query, 0, sizeof(STORAGE_PROPERTY_QUERY));
         query.PropertyId = propertyID;
         query.QueryType = PropertyStandardQuery;
-        success = DeviceIoControl(deviceHandle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(STORAGE_PROPERTY_QUERY), outputData, outputDataLength, &returnedData, NULL);
+        success = DeviceIoControl(deviceHandle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(STORAGE_PROPERTY_QUERY), outputData, outputDataLength, &returnedData, M_NULLPTR);
         if (!success)
         {
             ret = NOT_SUPPORTED;
@@ -3307,16 +3435,16 @@ static bool storage_Property_Exists(HANDLE deviceHandle, STORAGE_PROPERTY_ID pro
 //This is used internally by many of the pieces of code to read properties since it's very similar in how it gets requested for each of them.
 //the "sizeOfExpectedPropertyStructure" is meant to be a sizeof(MSFT_STORAGE_STRUCT) output. This exists because some devices or drivers don't
 //necessarily report accurate sizes for certain calls which can result in really weird data if not at least a minimum expected size.
-static int check_And_Get_Storage_Property(HANDLE deviceHandle, STORAGE_PROPERTY_ID propertyID, void **outputData, size_t sizeOfExpectedPropertyStructure)
+static eReturnValues check_And_Get_Storage_Property(HANDLE deviceHandle, STORAGE_PROPERTY_ID propertyID, void **outputData, size_t sizeOfExpectedPropertyStructure)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
     DWORD propertyDataSize = 0;
     if (outputData)
     {
         if (storage_Property_Exists(deviceHandle, propertyID, &propertyDataSize))
         {
             propertyDataSize = C_CAST(DWORD, M_Max(sizeOfExpectedPropertyStructure, propertyDataSize));
-            *outputData = calloc(propertyDataSize, sizeof(uint8_t));
+            *outputData = safe_calloc(propertyDataSize, sizeof(uint8_t));
             if (*outputData)
             {
                 ret = win_Get_Property_Data(deviceHandle, propertyID, *outputData, propertyDataSize);
@@ -3334,100 +3462,115 @@ static int check_And_Get_Storage_Property(HANDLE deviceHandle, STORAGE_PROPERTY_
     return ret;
 }
 
-static int win_Get_Device_Descriptor(HANDLE deviceHandle, PSTORAGE_DEVICE_DESCRIPTOR *deviceData)
+static M_INLINE void safe_free_device_descriptor(STORAGE_DEVICE_DESCRIPTOR **devdesc)
+{
+    safe_Free(M_REINTERPRET_CAST(void**, devdesc));
+}
+
+static eReturnValues win_Get_Device_Descriptor(HANDLE deviceHandle, PSTORAGE_DEVICE_DESCRIPTOR *deviceData)
 {
     return check_And_Get_Storage_Property(deviceHandle, StorageDeviceProperty, C_CAST(void**, deviceData), sizeof(STORAGE_DEVICE_DESCRIPTOR));
 }
 
-static int win_Get_Adapter_Descriptor(HANDLE deviceHandle, PSTORAGE_ADAPTER_DESCRIPTOR *adapterData)
+static M_INLINE void safe_free_adapter_descriptor(STORAGE_ADAPTER_DESCRIPTOR **adapterdesc)
+{
+    safe_Free(M_REINTERPRET_CAST(void**, adapterdesc));
+}
+
+static eReturnValues win_Get_Adapter_Descriptor(HANDLE deviceHandle, PSTORAGE_ADAPTER_DESCRIPTOR *adapterData)
 {
     return check_And_Get_Storage_Property(deviceHandle, StorageAdapterProperty, C_CAST(void**, adapterData), sizeof(STORAGE_ADAPTER_DESCRIPTOR));
 }
 
 //SCSI VPD device IDs
-static int win_Get_Device_ID_Property(HANDLE deviceHandle, PSTORAGE_DEVICE_ID_DESCRIPTOR *deviceIdData)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceIdProperty, C_CAST(void**, deviceIdData), sizeof(STORAGE_DEVICE_ID_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Device_ID_Property(HANDLE deviceHandle, PSTORAGE_DEVICE_ID_DESCRIPTOR *deviceIdData)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceIdProperty, C_CAST(void**, deviceIdData), sizeof(STORAGE_DEVICE_ID_DESCRIPTOR));
+//}
 
 #if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_VISTA
-static int win_Get_Write_Cache_Info(HANDLE *deviceHandle, PSTORAGE_WRITE_CACHE_PROPERTY *writeCacheInfo)
+//static eReturnValues win_Get_Write_Cache_Info(HANDLE *deviceHandle, PSTORAGE_WRITE_CACHE_PROPERTY *writeCacheInfo)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceWriteCacheProperty, C_CAST(void**, writeCacheInfo), sizeof(STORAGE_WRITE_CACHE_PROPERTY));
+//}
+
+static M_INLINE void safe_free_storage_access_alignment(STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR **accessalignment)
 {
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceWriteCacheProperty, C_CAST(void**, writeCacheInfo), sizeof(STORAGE_WRITE_CACHE_PROPERTY));
+    safe_Free(M_REINTERPRET_CAST(void**, accessalignment));
 }
 
-static int win_Get_Access_Alignment_Descriptor(HANDLE *deviceHandle, PSTORAGE_ACCESS_ALIGNMENT_DESCRIPTOR *alignmentDescriptor)
+static eReturnValues win_Get_Access_Alignment_Descriptor(HANDLE *deviceHandle, PSTORAGE_ACCESS_ALIGNMENT_DESCRIPTOR *alignmentDescriptor)
 {
     return check_And_Get_Storage_Property(deviceHandle, StorageAccessAlignmentProperty, C_CAST(void**, alignmentDescriptor), sizeof(STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR));
 }
 #endif //SEA_WIN32_WINNT_VISTA
 
 #if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN7
-static int win_Get_Seek_Time_Penalty(HANDLE *deviceHandle, PDEVICE_SEEK_PENALTY_DESCRIPTOR *seekTimePenaltyDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceSeekPenaltyProperty, C_CAST(void**, seekTimePenaltyDescriptor), sizeof(DEVICE_SEEK_PENALTY_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Seek_Time_Penalty(HANDLE *deviceHandle, PDEVICE_SEEK_PENALTY_DESCRIPTOR *seekTimePenaltyDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceSeekPenaltyProperty, C_CAST(void**, seekTimePenaltyDescriptor), sizeof(DEVICE_SEEK_PENALTY_DESCRIPTOR));
+//}
 
-static int win_Get_Trim(HANDLE *deviceHandle, PDEVICE_TRIM_DESCRIPTOR *trimDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceTrimProperty, C_CAST(void**, trimDescriptor), sizeof(DEVICE_TRIM_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Trim(HANDLE *deviceHandle, PDEVICE_TRIM_DESCRIPTOR *trimDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceTrimProperty, C_CAST(void**, trimDescriptor), sizeof(DEVICE_TRIM_DESCRIPTOR));
+//}
 #endif //SEA_WIN32_WINNT_WIN7
 
 #if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN8
-static int win_Get_Logical_Block_Provisioning(HANDLE *deviceHandle, PDEVICE_LB_PROVISIONING_DESCRIPTOR *lbProvisioningDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceLBProvisioningProperty, C_CAST(void**, lbProvisioningDescriptor), sizeof(DEVICE_LB_PROVISIONING_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Logical_Block_Provisioning(HANDLE *deviceHandle, PDEVICE_LB_PROVISIONING_DESCRIPTOR *lbProvisioningDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceLBProvisioningProperty, C_CAST(void**, lbProvisioningDescriptor), sizeof(DEVICE_LB_PROVISIONING_DESCRIPTOR));
+//}
 
-static int win_Get_Power_Property(HANDLE *deviceHandle, PDEVICE_POWER_DESCRIPTOR *powerDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDevicePowerProperty, C_CAST(void**, powerDescriptor), sizeof(DEVICE_POWER_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Power_Property(HANDLE *deviceHandle, PDEVICE_POWER_DESCRIPTOR *powerDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDevicePowerProperty, C_CAST(void**, powerDescriptor), sizeof(DEVICE_POWER_DESCRIPTOR));
+//}
 
-static int win_Get_Copy_Offload(HANDLE *deviceHandle, PDEVICE_COPY_OFFLOAD_DESCRIPTOR *copyOffloadDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceCopyOffloadProperty, C_CAST(void**, copyOffloadDescriptor), sizeof(DEVICE_COPY_OFFLOAD_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Copy_Offload(HANDLE *deviceHandle, PDEVICE_COPY_OFFLOAD_DESCRIPTOR *copyOffloadDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceCopyOffloadProperty, C_CAST(void**, copyOffloadDescriptor), sizeof(DEVICE_COPY_OFFLOAD_DESCRIPTOR));
+//}
 
-static int win_Get_Resiliency_Descriptor(HANDLE *deviceHandle, PSTORAGE_DEVICE_RESILIENCY_DESCRIPTOR *resiliencyDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceResiliencyProperty, C_CAST(void**, resiliencyDescriptor), sizeof(STORAGE_DEVICE_RESILIENCY_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Resiliency_Descriptor(HANDLE *deviceHandle, PSTORAGE_DEVICE_RESILIENCY_DESCRIPTOR *resiliencyDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceResiliencyProperty, C_CAST(void**, resiliencyDescriptor), sizeof(STORAGE_DEVICE_RESILIENCY_DESCRIPTOR));
+//}
 #endif //#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN8
 
 #if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WINBLUE
-static int win_Get_Medium_Product_Type(HANDLE *deviceHandle, PSTORAGE_MEDIUM_PRODUCT_TYPE_DESCRIPTOR  *mediumType)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceMediumProductType, C_CAST(void**, mediumType), sizeof(STORAGE_MEDIUM_PRODUCT_TYPE_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Medium_Product_Type(HANDLE *deviceHandle, PSTORAGE_MEDIUM_PRODUCT_TYPE_DESCRIPTOR  *mediumType)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceMediumProductType, C_CAST(void**, mediumType), sizeof(STORAGE_MEDIUM_PRODUCT_TYPE_DESCRIPTOR));
+//}
 #endif //SEA_WIN32_WINNT_WINBLUE a.k.a. 8.1
 
 #if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN10
-static int win_Get_IO_Capability(HANDLE *deviceHandle, PSTORAGE_DEVICE_IO_CAPABILITY_DESCRIPTOR *capabilityDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceIoCapabilityProperty, C_CAST(void**, capabilityDescriptor), sizeof(STORAGE_DEVICE_IO_CAPABILITY_DESCRIPTOR));
-}
+//static eReturnValues win_Get_IO_Capability(HANDLE *deviceHandle, PSTORAGE_DEVICE_IO_CAPABILITY_DESCRIPTOR *capabilityDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceIoCapabilityProperty, C_CAST(void**, capabilityDescriptor), sizeof(STORAGE_DEVICE_IO_CAPABILITY_DESCRIPTOR));
+//}
 
-static int win_Get_Adapter_Temperature(HANDLE *deviceHandle, PSTORAGE_TEMPERATURE_DATA_DESCRIPTOR *temperatureDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterTemperatureProperty, C_CAST(void**, temperatureDescriptor), sizeof(STORAGE_TEMPERATURE_DATA_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Adapter_Temperature(HANDLE *deviceHandle, PSTORAGE_TEMPERATURE_DATA_DESCRIPTOR *temperatureDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterTemperatureProperty, C_CAST(void**, temperatureDescriptor), sizeof(STORAGE_TEMPERATURE_DATA_DESCRIPTOR));
+//}
 
-static int win_Get_Device_Temperature(HANDLE *deviceHandle, PSTORAGE_TEMPERATURE_DATA_DESCRIPTOR *temperatureDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceTemperatureProperty, C_CAST(void**, temperatureDescriptor), sizeof(STORAGE_TEMPERATURE_DATA_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Device_Temperature(HANDLE *deviceHandle, PSTORAGE_TEMPERATURE_DATA_DESCRIPTOR *temperatureDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceTemperatureProperty, C_CAST(void**, temperatureDescriptor), sizeof(STORAGE_TEMPERATURE_DATA_DESCRIPTOR));
+//}
 
-static int win_Get_Adapter_Physical_Topology(HANDLE *deviceHandle, PSTORAGE_PHYSICAL_TOPOLOGY_DESCRIPTOR  *topologyDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterPhysicalTopologyProperty, C_CAST(void**, topologyDescriptor), sizeof(STORAGE_PHYSICAL_TOPOLOGY_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Adapter_Physical_Topology(HANDLE *deviceHandle, PSTORAGE_PHYSICAL_TOPOLOGY_DESCRIPTOR  *topologyDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterPhysicalTopologyProperty, C_CAST(void**, topologyDescriptor), sizeof(STORAGE_PHYSICAL_TOPOLOGY_DESCRIPTOR));
+//}
 
-static int win_Get_Device_Physical_Topology(HANDLE *deviceHandle, PSTORAGE_PHYSICAL_TOPOLOGY_DESCRIPTOR  *topologyDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDevicePhysicalTopologyProperty, C_CAST(void**, topologyDescriptor), sizeof(STORAGE_PHYSICAL_TOPOLOGY_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Device_Physical_Topology(HANDLE *deviceHandle, PSTORAGE_PHYSICAL_TOPOLOGY_DESCRIPTOR  *topologyDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDevicePhysicalTopologyProperty, C_CAST(void**, topologyDescriptor), sizeof(STORAGE_PHYSICAL_TOPOLOGY_DESCRIPTOR));
+//}
 
 #if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_10586
 /*
@@ -3438,77 +3581,77 @@ static int win_Get_Device_Physical_Topology(HANDLE *deviceHandle, PSTORAGE_PHYSI
 #define STORAGE_ATTRIBUTE_ASYNC_EVENT_NOTIFICATION  0x10
 #define STORAGE_ATTRIBUTE_PERF_SIZE_INDEPENDENT     0x20
 */
-static int win_Get_Device_Attributes(HANDLE *deviceHandle, PSTORAGE_DEVICE_ATTRIBUTES_DESCRIPTOR *deviceAttributes)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceAttributesProperty, C_CAST(void**, deviceAttributes), sizeof(STORAGE_DEVICE_ATTRIBUTES_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Device_Attributes(HANDLE *deviceHandle, PSTORAGE_DEVICE_ATTRIBUTES_DESCRIPTOR *deviceAttributes)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceAttributesProperty, C_CAST(void**, deviceAttributes), sizeof(STORAGE_DEVICE_ATTRIBUTES_DESCRIPTOR));
+//}
 #endif //WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_10586
 
 #if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
-static int win_Get_Rpmb(HANDLE *deviceHandle, PSTORAGE_RPMB_DESCRIPTOR *rpmbDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterRpmbProperty, C_CAST(void**, rpmbDescriptor), sizeof(STORAGE_RPMB_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Rpmb(HANDLE *deviceHandle, PSTORAGE_RPMB_DESCRIPTOR *rpmbDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterRpmbProperty, C_CAST(void**, rpmbDescriptor), sizeof(STORAGE_RPMB_DESCRIPTOR));
+//}
 
-static int win_Get_Device_Management_Status(HANDLE *deviceHandle, PSTORAGE_DEVICE_MANAGEMENT_STATUS *managementStatus)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceManagementStatus, C_CAST(void**, managementStatus), sizeof(STORAGE_DEVICE_MANAGEMENT_STATUS));
-}
+//static eReturnValues win_Get_Device_Management_Status(HANDLE *deviceHandle, PSTORAGE_DEVICE_MANAGEMENT_STATUS *managementStatus)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceManagementStatus, C_CAST(void**, managementStatus), sizeof(STORAGE_DEVICE_MANAGEMENT_STATUS));
+//}
 
-static int win_Get_Adapter_Serial_Number(HANDLE *deviceHandle, PSTORAGE_ADAPTER_SERIAL_NUMBER *adapterSerialNumber)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterSerialNumberProperty, C_CAST(void**, adapterSerialNumber), sizeof(STORAGE_ADAPTER_SERIAL_NUMBER));
-}
+//static eReturnValues win_Get_Adapter_Serial_Number(HANDLE *deviceHandle, PSTORAGE_ADAPTER_SERIAL_NUMBER *adapterSerialNumber)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterSerialNumberProperty, C_CAST(void**, adapterSerialNumber), sizeof(STORAGE_ADAPTER_SERIAL_NUMBER));
+//}
 
-static int win_Get_Device_Location(HANDLE *deviceHandle, PSTORAGE_DEVICE_LOCATION_DESCRIPTOR *deviceLocation)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceLocationProperty, C_CAST(void**, deviceLocation), sizeof(STORAGE_DEVICE_LOCATION_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Device_Location(HANDLE *deviceHandle, PSTORAGE_DEVICE_LOCATION_DESCRIPTOR *deviceLocation)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceLocationProperty, C_CAST(void**, deviceLocation), sizeof(STORAGE_DEVICE_LOCATION_DESCRIPTOR));
+//}
 #endif //WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
 
 #if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_15063
-static int win_Get_Crypto_Property(HANDLE *deviceHandle, PSTORAGE_CRYPTO_DESCRIPTOR *cryptoDescriptor)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterCryptoProperty, C_CAST(void**, cryptoDescriptor), sizeof(STORAGE_CRYPTO_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Crypto_Property(HANDLE *deviceHandle, PSTORAGE_CRYPTO_DESCRIPTOR *cryptoDescriptor)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageAdapterCryptoProperty, C_CAST(void**, cryptoDescriptor), sizeof(STORAGE_CRYPTO_DESCRIPTOR));
+//}
 
 //STORAGE_DEVICE_NUMA_NODE_UNKNOWN
-static int win_Get_Device_Numa_Property(HANDLE *deviceHandle, PSTORAGE_DEVICE_NUMA_PROPERTY *numaProperty)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceNumaProperty, C_CAST(void**, numaProperty), sizeof(STORAGE_DEVICE_NUMA_PROPERTY));
-}
+//static eReturnValues win_Get_Device_Numa_Property(HANDLE *deviceHandle, PSTORAGE_DEVICE_NUMA_PROPERTY *numaProperty)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceNumaProperty, C_CAST(void**, numaProperty), sizeof(STORAGE_DEVICE_NUMA_PROPERTY));
+//}
 #endif //WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_15063
 
 #if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_16299
-static int win_Get_Device_Zoned_Property(HANDLE *deviceHandle, PSTORAGE_ZONED_DEVICE_DESCRIPTOR *zonedProperty)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceZonedDeviceProperty, C_CAST(void**, zonedProperty), sizeof(STORAGE_ZONED_DEVICE_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Device_Zoned_Property(HANDLE *deviceHandle, PSTORAGE_ZONED_DEVICE_DESCRIPTOR *zonedProperty)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceZonedDeviceProperty, C_CAST(void**, zonedProperty), sizeof(STORAGE_ZONED_DEVICE_DESCRIPTOR));
+//}
 
-static int win_Get_Device_Unsafe_Shutdown_Count(HANDLE *deviceHandle, PSTORAGE_DEVICE_UNSAFE_SHUTDOWN_COUNT *unsafeShutdownCount)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceUnsafeShutdownCount, C_CAST(void**, unsafeShutdownCount), sizeof(STORAGE_DEVICE_UNSAFE_SHUTDOWN_COUNT));
-}
+//static eReturnValues win_Get_Device_Unsafe_Shutdown_Count(HANDLE *deviceHandle, PSTORAGE_DEVICE_UNSAFE_SHUTDOWN_COUNT *unsafeShutdownCount)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceUnsafeShutdownCount, C_CAST(void**, unsafeShutdownCount), sizeof(STORAGE_DEVICE_UNSAFE_SHUTDOWN_COUNT));
+//}
 #endif //#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_16299
 
 #if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_18362
-static int win_Get_Device_Endurance(HANDLE *deviceHandle, PSTORAGE_HW_ENDURANCE_DATA_DESCRIPTOR *enduranceProperty)
-{
-    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceEnduranceProperty, C_CAST(void**, enduranceProperty), sizeof(STORAGE_HW_ENDURANCE_DATA_DESCRIPTOR));
-}
+//static eReturnValues win_Get_Device_Endurance(HANDLE *deviceHandle, PSTORAGE_HW_ENDURANCE_DATA_DESCRIPTOR *enduranceProperty)
+//{
+//    return check_And_Get_Storage_Property(deviceHandle, StorageDeviceEnduranceProperty, C_CAST(void**, enduranceProperty), sizeof(STORAGE_HW_ENDURANCE_DATA_DESCRIPTOR));
+//}
 #endif //WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_18362
 
 #endif //SEA_WIN32_WINNT_WIN10
 
 #endif //SEA_WIN32_WINNT_WINXP for storage query property calls.
 
-#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WINXP 
+#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WINXP && defined(IOCTL_DISK_UPDATE_PROPERTIES)
 //This function is supposed to update partition table information after it has been changed...this should work after an erase has been done to a drive - TJE
-int win_Update_Disk_Properties(HANDLE* deviceHandle)
+static eReturnValues win_Update_Disk_Properties(HANDLE* deviceHandle)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
     DWORD bytesReturned = 0;
-    if (DeviceIoControl(deviceHandle, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &bytesReturned, NULL))
+    if (DeviceIoControl(deviceHandle, IOCTL_DISK_UPDATE_PROPERTIES, M_NULLPTR, 0, M_NULLPTR, 0, &bytesReturned, M_NULLPTR))
     {
         ret = SUCCESS;
     }
@@ -3517,9 +3660,9 @@ int win_Update_Disk_Properties(HANDLE* deviceHandle)
 
 #endif //for IOCTL_DISK_UPDATE_PROPERTIES 
 
-int os_Update_File_System_Cache(tDevice* device)
+eReturnValues os_Update_File_System_Cache(tDevice* device)
 {
-#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WINXP 
+#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WINXP && defined(IOCTL_DISK_UPDATE_PROPERTIES)
     //TODO: Need to find a way to support other things like RAID or CSMI, etc in the future - TJE
     return win_Update_Disk_Properties(device->os_info.fd);
 #else
@@ -3529,138 +3672,64 @@ int os_Update_File_System_Cache(tDevice* device)
 #endif
 }
 
-//WinVer not wrapping this IOCTL...so it's probably old enough not to need it - TJE
-static int win_Get_Drive_Geometry(HANDLE devHandle, PDISK_GEOMETRY *geom)
+#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WINXP && defined(IOCTL_DISK_DELETE_DRIVE_LAYOUT )
+//This function is supposed to update partition table information after it has been changed...this should work after an erase has been done to a drive - TJE
+static eReturnValues win_Delete_Drive_Layout(HANDLE* deviceHandle)
 {
-    int ret = FAILURE;
+    eReturnValues ret = NOT_SUPPORTED;
+    DWORD bytesReturned = 0;
+    if (DeviceIoControl(deviceHandle, IOCTL_DISK_DELETE_DRIVE_LAYOUT, M_NULLPTR, 0, M_NULLPTR, 0, &bytesReturned, M_NULLPTR))
+    {
+        ret = SUCCESS;
+    }
+    return ret;
+}
+
+#endif //for IOCTL_DISK_UPDATE_PROPERTIES 
+
+eReturnValues os_Erase_Boot_Sectors(tDevice* device)
+{
+#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WINXP && defined(IOCTL_DISK_UPDATE_PROPERTIES)
+    if (device->raid_device || device->issue_io || device->issue_nvme_io)
+    {
+        //do not do anything here for RAID devices. This is really only needed for JBOD.
+        return SUCCESS;
+    }
+    else
+    {
+        return win_Delete_Drive_Layout(device->os_info.fd);
+    }
+#else
+    //Not supported on this old of an OS - TJE
+    M_USE_UNUSED(device);
+    return NOT_SUPPORTED;
+#endif
+}
+
+static M_INLINE void safe_free_disk_geometry(DISK_GEOMETRY **geom)
+{
+    safe_Free(M_REINTERPRET_CAST(void**, geom));
+}
+
+//WinVer not wrapping this IOCTL...so it's probably old enough not to need it - TJE
+static eReturnValues win_Get_Drive_Geometry(HANDLE devHandle, PDISK_GEOMETRY *geom)
+{
+    eReturnValues ret = FAILURE;
     DWORD bytesReturned = 0;
     DWORD diskGeomSize = sizeof(DISK_GEOMETRY);
-    *geom = C_CAST(PDISK_GEOMETRY, malloc(diskGeomSize));
-    if (DeviceIoControl(devHandle, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0, *geom, diskGeomSize, &bytesReturned, NULL))
-    {
-        ret = SUCCESS;
-    }
-    else
-    {
-        safe_Free(*geom)
-    }
-    return ret;
-}
-
-static int win_Disk_Is_Writable(HANDLE devHandle, bool *writable)
-{
-    int ret = SUCCESS;
-    DWORD bytesReturned = 0;
-    if (!writable)
-    {
-        return BAD_PARAMETER;
-    }
-    if (DeviceIoControl(devHandle, IOCTL_DISK_IS_WRITABLE, NULL, 0, NULL, 0, &bytesReturned, NULL))
-    {
-        *writable = true;
-    }
-    else
-    {
-        *writable = false;
-        DWORD lastError = GetLastError();
-        switch (lastError)
-        {
-        case ERROR_WRITE_PROTECT:
-            *writable = false;
-            break;
-        default:
-            *writable = true;
-            break;
-        }
-        print_Windows_Error_To_Screen(lastError);
-    }
-    return ret;
-}
-
-#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN2K
-static int win_Get_IDE_Disk_Controller_Number_And_Disk_Number(HANDLE *devHandle, PDISK_CONTROLLER_NUMBER *numbers)
-{
-    int ret = FAILURE;
-    DWORD bytesReturned = 0;
-    DWORD controllerNumberSize = sizeof(DISK_CONTROLLER_NUMBER);
-    *numbers = C_CAST(PDISK_CONTROLLER_NUMBER, malloc(controllerNumberSize));
-    if (DeviceIoControl(devHandle, IOCTL_DISK_CONTROLLER_NUMBER, NULL, 0, *numbers, controllerNumberSize, &bytesReturned, NULL))
-    {
-        ret = SUCCESS;
-    }
-    else
-    {
-        safe_Free(*numbers)
-    }
-    return ret;
-}
-#endif //SEA_WIN32_WINNT_NT4
-
-#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN2K
-//Geom param is required as this allocates memory for this call.
-//partInfo and detectInfo are optional and are meant to be helpful to set these pointers correctly for you from returned data rather than needing to figure it out yourself.
-//geom should be free'd when done with it since it is allocated on the heap.
-//If partinfo or detectinfo are null on completion, then these we not returned in this IOCTL
-/* Example Use:
-    PDISK_GEOMETRY_EX diskGeom = NULL;
-    PDISK_PARTITION_INFO partInfo = NULL;
-    PDISK_DETECTION_INFO diskDetect = NULL;
-
-    if (SUCCESS == win_Get_Drive_Geometry_Ex(device->os_info.fd, &diskGeom, &partInfo, &diskDetect))
-    {
-        //Do stuff with diskGeom, partInfo, & diskDetect
-        safe_Free(diskGeom)
-    }
-*/
-static int win_Get_Drive_Geometry_Ex(HANDLE devHandle, PDISK_GEOMETRY_EX *geom, PDISK_PARTITION_INFO *partInfo, PDISK_DETECTION_INFO *detectInfo)
-{
-    int ret = FAILURE;
-    DWORD bytesReturned = 0;
-    DWORD diskGeomSize = sizeof(DISK_GEOMETRY) + sizeof(LARGE_INTEGER) + sizeof(DISK_PARTITION_INFO) + sizeof(DISK_DETECTION_INFO);
     if (geom)
     {
-        *geom = C_CAST(PDISK_GEOMETRY_EX, malloc(diskGeomSize));
+        *geom = C_CAST(PDISK_GEOMETRY, safe_malloc(diskGeomSize));
         if (*geom)
         {
-            if (DeviceIoControl(devHandle,
-                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-                NULL,
-                0,
-                *geom,
-                diskGeomSize,
-                &bytesReturned,
-                NULL
-            ))
+            memset(*geom, 0, diskGeomSize);
+            if (DeviceIoControl(devHandle, IOCTL_DISK_GET_DRIVE_GEOMETRY, M_NULLPTR, 0, *geom, diskGeomSize, &bytesReturned, M_NULLPTR))
             {
                 ret = SUCCESS;
-                //Setup the other pointers if they were provided.
-                if (partInfo)
-                {
-                    *partInfo = C_CAST(PDISK_PARTITION_INFO, (*geom)->Data);
-                    if ((*partInfo)->SizeOfPartitionInfo)
-                    {
-                        if (detectInfo)
-                        {
-                            *detectInfo = C_CAST(PDISK_DETECTION_INFO, &(*geom)->Data[(*partInfo)->SizeOfPartitionInfo]);
-                            if (!(*detectInfo)->SizeOfDetectInfo)
-                            {
-                                *detectInfo = NULL;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        *partInfo = NULL;
-                        if (detectInfo)
-                        {
-                            *detectInfo = NULL;
-                        }
-                    }
-                }
             }
             else
             {
-                safe_Free(*geom)
+                safe_free_disk_geometry(geom);
             }
         }
         else
@@ -3675,82 +3744,260 @@ static int win_Get_Drive_Geometry_Ex(HANDLE devHandle, PDISK_GEOMETRY_EX *geom, 
     return ret;
 }
 
-static int win_Get_Length_Information(HANDLE *devHandle, PGET_LENGTH_INFORMATION *length)
+//static eReturnValues win_Disk_Is_Writable(HANDLE devHandle, bool *writable)
+//{
+//    eReturnValues ret = SUCCESS;
+//    DWORD bytesReturned = 0;
+//    if (!writable)
+//    {
+//        return BAD_PARAMETER;
+//    }
+//    if (DeviceIoControl(devHandle, IOCTL_DISK_IS_WRITABLE, M_NULLPTR, 0, M_NULLPTR, 0, &bytesReturned, M_NULLPTR))
+//    {
+//        *writable = true;
+//    }
+//    else
+//    {
+//        *writable = false;
+//        DWORD lastError = GetLastError();
+//        switch (lastError)
+//        {
+//        case ERROR_WRITE_PROTECT:
+//            *writable = false;
+//            break;
+//        default:
+//            *writable = true;
+//            break;
+//        }
+//        print_Windows_Error_To_Screen(lastError);
+//    }
+//    return ret;
+//}
+
+#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN2K
+// static M_INLINE void safe_free_disk_controller_number(DISK_CONTROLLER_NUMBER **ctrlnum)
+// {
+//     safe_Free(M_REINTERPRET_CAST(void**, ctrlnum));
+// }
+//
+//static eReturnValues win_Get_IDE_Disk_Controller_Number_And_Disk_Number(HANDLE *devHandle, PDISK_CONTROLLER_NUMBER *numbers)
+//{
+//    eReturnValues ret = FAILURE;
+//    DWORD bytesReturned = 0;
+//    DWORD controllerNumberSize = sizeof(DISK_CONTROLLER_NUMBER);
+//    if (numbers)
+//    {
+//        *numbers = C_CAST(PDISK_CONTROLLER_NUMBER, safe_malloc(controllerNumberSize));
+//        if (*numbers)
+//        {
+//            memset(*numbers, 0, controllerNumberSize);
+//            if (DeviceIoControl(devHandle, IOCTL_DISK_CONTROLLER_NUMBER, M_NULLPTR, 0, *numbers, controllerNumberSize, &bytesReturned, M_NULLPTR))
+//            {
+//                ret = SUCCESS;
+//            }
+//            else
+//            {
+//                safe_free_disk_controller_number(numbers);
+//            }
+//        }
+//        else
+//        {
+//            ret = MEMORY_FAILURE;
+//        }
+//    }
+//    else
+//    {
+//        ret = BAD_PARAMETER;
+//    }
+//    return ret;
+//}
+#endif //SEA_WIN32_WINNT_NT4
+
+#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN2K
+//Geom param is required as this allocates memory for this call.
+//partInfo and detectInfo are optional and are meant to be helpful to set these pointers correctly for you from returned data rather than needing to figure it out yourself.
+//geom should be free'd when done with it since it is allocated on the heap.
+//If partinfo or detectinfo are null on completion, then these we not returned in this IOCTL
+/* Example Use:
+    PDISK_GEOMETRY_EX diskGeom = M_NULLPTR;
+    PDISK_PARTITION_INFO partInfo = M_NULLPTR;
+    PDISK_DETECTION_INFO diskDetect = M_NULLPTR;
+
+    if (SUCCESS == win_Get_Drive_Geometry_Ex(device->os_info.fd, &diskGeom, &partInfo, &diskDetect))
+    {
+        //Do stuff with diskGeom, partInfo, & diskDetect
+        safe_free(&diskGeom);
+    }
+*/
+
+static M_INLINE void safe_free_disk_geometry_ex(DISK_GEOMETRY_EX **geom)
 {
-    int ret = FAILURE;
-    DWORD bytesReturned = 0;
-    DWORD lengthInfoSize = sizeof(GET_LENGTH_INFORMATION);
-    *length = C_CAST(PGET_LENGTH_INFORMATION, malloc(lengthInfoSize));
-    if (DeviceIoControl(devHandle, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, *length, lengthInfoSize, &bytesReturned, NULL))
-    {
-        ret = SUCCESS;
-    }
-    else
-    {
-        safe_Free(*length)
-    }
-    return ret;
+    safe_Free(M_REINTERPRET_CAST(void**, geom));
 }
 
-#endif //SEA_WIN32_WINNT_WIN2K
-
-#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN8
-static int win_SCSI_Get_Inquiry_Data(HANDLE deviceHandle, PSCSI_ADAPTER_BUS_INFO *scsiBusInfo)
+static eReturnValues win_Get_Drive_Geometry_Ex(HANDLE devHandle, PDISK_GEOMETRY_EX *geom, PDISK_PARTITION_INFO *partInfo, PDISK_DETECTION_INFO *detectInfo)
 {
-    int ret = SUCCESS;
-    UCHAR busCount = 1, luCount = 1;
-    DWORD inquiryDataSize = sizeof(SCSI_INQUIRY_DATA) + INQUIRYDATABUFFERSIZE;//this is supposed to be rounded up to an alignment boundary??? but that is not well described...
-    DWORD busDataLength = sizeof(SCSI_ADAPTER_BUS_INFO) + busCount * sizeof(SCSI_BUS_DATA) + luCount * inquiryDataSize;//Start with this, but more memory may be necessary.
-    *scsiBusInfo = C_CAST(PSCSI_ADAPTER_BUS_INFO, calloc_aligned(busDataLength, sizeof(uint8_t), 8));
-    if (scsiBusInfo)
+    eReturnValues ret = FAILURE;
+    DWORD bytesReturned = 0;
+    DWORD diskGeomSize = sizeof(DISK_GEOMETRY) + sizeof(LARGE_INTEGER) + sizeof(DISK_PARTITION_INFO) + sizeof(DISK_DETECTION_INFO);
+    if (geom)
     {
-        BOOL success = FALSE;
-        DWORD returnedBytes = 0;
-        while (!success)
+        *geom = C_CAST(PDISK_GEOMETRY_EX, safe_malloc(diskGeomSize));
+        if (*geom)
         {
-            //try this ioctl and reallocate memory if not enough space error is returned until it can be read!
-            success = DeviceIoControl(deviceHandle, IOCTL_SCSI_GET_INQUIRY_DATA, NULL, 0, scsiBusInfo, busDataLength, &returnedBytes, NULL);
-            if (!success)
+            memset(*geom, 0, diskGeomSize);
+            if (DeviceIoControl(devHandle,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                M_NULLPTR,
+                0,
+                *geom,
+                diskGeomSize,
+                &bytesReturned,
+                M_NULLPTR
+            ))
             {
-                DWORD error = GetLastError();
-                //figure out what the error was to see if we need to allocate more memory, or exit with errors.
-                if (error == ERROR_INSUFFICIENT_BUFFER)
+                ret = SUCCESS;
+                //Setup the other pointers if they were provided.
+                if (partInfo)
                 {
-                    //MSFT recommends doubling the buffer size until this passes.
-                    void *tempBuf = NULL;
-                    busDataLength *= 2;
-                    tempBuf = realloc_aligned(scsiBusInfo, busDataLength / 2, busDataLength, 8);
-                    if (tempBuf)
+                    *partInfo = M_REINTERPRET_CAST(PDISK_PARTITION_INFO, (*geom)->Data);
+                    if ((*partInfo)->SizeOfPartitionInfo)
                     {
-                        scsiBusInfo = tempBuf;
+                        if (detectInfo)
+                        {
+                            *detectInfo = M_REINTERPRET_CAST(PDISK_DETECTION_INFO, &(*geom)->Data[(*partInfo)->SizeOfPartitionInfo]);
+                            if (!(*detectInfo)->SizeOfDetectInfo)
+                            {
+                                *detectInfo = M_NULLPTR;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        *partInfo = M_NULLPTR;
+                        if (detectInfo)
+                        {
+                            *detectInfo = M_NULLPTR;
+                        }
                     }
                 }
-                else
-                {
-                    print_Windows_Error_To_Screen(error);
-                    ret = FAILURE;
-                    break;
-                }
             }
+            else
+            {
+                safe_free_disk_geometry_ex(geom);
+            }
+        }
+        else
+        {
+            ret = MEMORY_FAILURE;
         }
     }
     else
     {
-        ret = MEMORY_FAILURE;
+        ret = BAD_PARAMETER;
     }
     return ret;
 }
+
+// static M_INLINE void safe_free_len_info(GET_LENGTH_INFORMATION **length)
+// {
+//     safe_Free(M_REINTERPRET_CAST(void**, length));
+// }
+//static eReturnValues win_Get_Length_Information(HANDLE *devHandle, PGET_LENGTH_INFORMATION *length)
+//{
+//    eReturnValues ret = FAILURE;
+//    DWORD bytesReturned = 0;
+//    DWORD lengthInfoSize = sizeof(GET_LENGTH_INFORMATION);
+//    if (length)
+//    {
+//        *length = C_CAST(PGET_LENGTH_INFORMATION, safe_malloc(lengthInfoSize));
+//        if (*length)
+//        {
+//            memset(*length, 0, lengthInfoSize);
+//            if (DeviceIoControl(devHandle, IOCTL_DISK_GET_LENGTH_INFO, M_NULLPTR, 0, *length, lengthInfoSize, &bytesReturned, M_NULLPTR))
+//            {
+//                ret = SUCCESS;
+//            }
+//            else
+//            {
+//                safe_free_len_info(length);
+//            }
+//        }
+//        else
+//        {
+//            ret = MEMORY_FAILURE;
+//        }
+//    }
+//    else
+//    {
+//        ret = BAD_PARAMETER;
+//    }
+//    return ret;
+//}
+
+#endif //SEA_WIN32_WINNT_WIN2K
+
+#if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN8
+//static eReturnValues win_SCSI_Get_Inquiry_Data(HANDLE deviceHandle, PSCSI_ADAPTER_BUS_INFO *scsiBusInfo)
+//{
+//    eReturnValues ret = SUCCESS;
+//    UCHAR busCount = 1, luCount = 1;
+//    DWORD inquiryDataSize = sizeof(SCSI_INQUIRY_DATA) + INQUIRYDATABUFFERSIZE;//this is supposed to be rounded up to an alignment boundary??? but that is not well described...
+//    DWORD busDataLength = sizeof(SCSI_ADAPTER_BUS_INFO) + busCount * sizeof(SCSI_BUS_DATA) + luCount * inquiryDataSize;//Start with this, but more memory may be necessary.
+//    *scsiBusInfo = C_CAST(PSCSI_ADAPTER_BUS_INFO, safe_calloc_aligned(busDataLength, sizeof(uint8_t), 8));
+//    if (scsiBusInfo)
+//    {
+//        BOOL success = FALSE;
+//        DWORD returnedBytes = 0;
+//        while (!success)
+//        {
+//            //try this ioctl and reallocate memory if not enough space error is returned until it can be read!
+//            success = DeviceIoControl(deviceHandle, IOCTL_SCSI_GET_INQUIRY_DATA, M_NULLPTR, 0, scsiBusInfo, busDataLength, &returnedBytes, M_NULLPTR);
+//            if (!success)
+//            {
+//                DWORD error = GetLastError();
+//                //figure out what the error was to see if we need to allocate more memory, or exit with errors.
+//                if (error == ERROR_INSUFFICIENT_BUFFER)
+//                {
+//                    //MSFT recommends doubling the buffer size until this passes.
+//                    void *tempBuf = M_NULLPTR;
+//                    busDataLength *= 2;
+//                    tempBuf = safe_realloc_aligned(scsiBusInfo, busDataLength / 2, busDataLength, 8);
+//                    if (tempBuf)
+//                    {
+//                        scsiBusInfo = tempBuf;
+//                    }
+//                }
+//                else
+//                {
+//                    print_Windows_Error_To_Screen(error);
+//                    ret = FAILURE;
+//                    break;
+//                }
+//            }
+//        }
+//    }
+//    else
+//    {
+//        ret = MEMORY_FAILURE;
+//    }
+//    return ret;
+//}
 #endif //SEA_WIN32_WINNT_WIN8
 
-// \return SUCCESS - pass, !SUCCESS fail or something went wrong
-static int get_Win_Device(const char *filename, tDevice *device )
-{
-    int                         ret           = FAILURE;
-    int                         win_ret       = 0;
-    PSTORAGE_DEVICE_DESCRIPTOR  device_desc   = NULL;
-    PSTORAGE_ADAPTER_DESCRIPTOR adapter_desc  = NULL;
+#define MAX_VOL_BITS (32)
+#define MAX_VOL_STR_LEN (8)
+#define MAX_DISK_EXTENTS (32)
 
-    TCHAR device_name[WIN_MAX_DEVICE_NAME_LENGTH] = { 0 };
+// \return SUCCESS - pass, !SUCCESS fail or something went wrong
+static eReturnValues get_Win_Device(const char *filename, tDevice *device )
+{
+    eReturnValues ret     = FAILURE;
+    eReturnValues win_ret = SUCCESS;
+    PSTORAGE_DEVICE_DESCRIPTOR  device_desc   = M_NULLPTR;
+    PSTORAGE_ADAPTER_DESCRIPTOR adapter_desc  = M_NULLPTR;
+
+    DECLARE_ZERO_INIT_ARRAY(TCHAR, device_name, WIN_MAX_DEVICE_NAME_LENGTH);
     TCHAR *ptrDeviceName = &device_name[0];
     _stprintf_s(device_name, WIN_MAX_DEVICE_NAME_LENGTH, TEXT("%hs"), filename);
 
@@ -3767,14 +4014,14 @@ static int get_Win_Device(const char *filename, tDevice *device )
                                        please write to developers  -MA */
                                     GENERIC_WRITE | GENERIC_READ, //FILE_ALL_ACCESS,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                    NULL,
+                                    M_NULLPTR,
                                     OPEN_EXISTING,
 #if !defined(WINDOWS_DISABLE_OVERLAPPED)
                                     FILE_FLAG_OVERLAPPED,
 #else
                                     0,
 #endif
-                                    NULL);
+                                    M_NULLPTR);
 
     device->os_info.last_error = GetLastError();
 
@@ -3791,87 +4038,123 @@ static int get_Win_Device(const char *filename, tDevice *device )
     }
     else
     {
+#if defined (WIN_DEBUG)
+        printf("WIN: opened dev\n");
+#endif //WIN_DEBUG
         device->os_info.scsiSRBHandle = INVALID_HANDLE_VALUE;//set this to invalid ahead of anywhere that it might get opened below for discovering additional capabilities.
         //set the handle name
         strcpy_s(device->os_info.name, OS_HANDLE_NAME_MAX_LENGTH, filename);
 
         if (strstr(device->os_info.name, WIN_PHYSICAL_DRIVE))
         {
-            uint32_t drive = UINT32_MAX;
-            sscanf_s(device->os_info.name, WIN_PHYSICAL_DRIVE "%" SCNu32, &drive);
-            snprintf(device->os_info.friendlyName, OS_HANDLE_FRIENDLY_NAME_MAX_LENGTH, "PD%" PRIu32, drive);
+            char* end = M_NULLPTR;
+            char *drivenum = strstr(device->os_info.name, WIN_PHYSICAL_DRIVE) + safe_strlen(WIN_PHYSICAL_DRIVE);
+            errno = 0;//clear to zero as stated in ISO C secure coding
+            unsigned long drive = strtoul(drivenum, &end, 10);
+            if ((drive == ULONG_MAX && errno == ERANGE) || (drive == 0 && end == drivenum))
+            {
+                return FAILURE;
+            }
+            snprintf(device->os_info.friendlyName, OS_HANDLE_FRIENDLY_NAME_MAX_LENGTH, "PD%lu", drive);
             device->os_info.os_drive_number = drive;
         }
         else if (strstr(device->os_info.name, WIN_CDROM_DRIVE))
         {
-            uint32_t drive = UINT32_MAX;
-            sscanf_s(device->os_info.name, WIN_CDROM_DRIVE "%" SCNu32, &drive);
-            snprintf(device->os_info.friendlyName, OS_HANDLE_FRIENDLY_NAME_MAX_LENGTH, "CDROM%" PRIu32, drive);
+            char* end = M_NULLPTR;
+            char* drivenum = strstr(device->os_info.name, WIN_CDROM_DRIVE) + safe_strlen(WIN_CDROM_DRIVE);
+            errno = 0;//clear to zero as stated in ISO C secure coding
+            unsigned long drive = strtoul(drivenum, &end, 10);
+            if ((drive == ULONG_MAX && errno == ERANGE) || (drive == 0 && end == drivenum))
+            {
+                return FAILURE;
+            }
+            snprintf(device->os_info.friendlyName, OS_HANDLE_FRIENDLY_NAME_MAX_LENGTH, "CDROM%lu", drive);
             device->os_info.os_drive_number = drive;
         }
         else if (strstr(device->os_info.name, WIN_TAPE_DRIVE))
         {
-            uint32_t drive = UINT32_MAX;
-            sscanf_s(device->os_info.name, WIN_TAPE_DRIVE "%" SCNu32, &drive);
-            snprintf(device->os_info.friendlyName, OS_HANDLE_FRIENDLY_NAME_MAX_LENGTH, "TAPE%" PRIu32, drive);
+            char* end = M_NULLPTR;
+            char* drivenum = strstr(device->os_info.name, WIN_TAPE_DRIVE) + safe_strlen(WIN_TAPE_DRIVE);
+            errno = 0;//clear to zero as stated in ISO C secure coding
+            unsigned long drive = strtoul(drivenum, &end, 10);
+            if ((drive == ULONG_MAX && errno == ERANGE) || (drive == 0 && end == drivenum))
+            {
+                return FAILURE;
+            }
+            snprintf(device->os_info.friendlyName, OS_HANDLE_FRIENDLY_NAME_MAX_LENGTH, "TAPE%lu", drive);
             device->os_info.os_drive_number = drive;
         }
         else if (strstr(device->os_info.name, WIN_CHANGER_DEVICE))
         {
-            uint32_t drive = UINT32_MAX;
-            sscanf_s(device->os_info.name, WIN_CHANGER_DEVICE "%" SCNu32, &drive);
-            snprintf(device->os_info.friendlyName, OS_HANDLE_FRIENDLY_NAME_MAX_LENGTH, "CHGR%" PRIu32, drive);
+            char* end = M_NULLPTR;
+            char* drivenum = strstr(device->os_info.name, WIN_CHANGER_DEVICE) + safe_strlen(WIN_CHANGER_DEVICE);
+            errno = 0;//clear to zero as stated in ISO C secure coding
+            unsigned long drive = strtoul(drivenum, &end, 10);
+            if ((drive == ULONG_MAX && errno == ERANGE) || (drive == 0 && end == drivenum))
+            {
+                return FAILURE;
+            }
+            snprintf(device->os_info.friendlyName, OS_HANDLE_FRIENDLY_NAME_MAX_LENGTH, "CHGR%lu", drive);
             device->os_info.os_drive_number = drive;
         }
-
+        //NOTE: No final else returning failure as we want to support some other handles that don't map to these easy names.
+        //      There are very long names for a drive handle we can also support if a caller knows how to pass them in.
+#if defined (WIN_DEBUG)
+        printf("WIN: Checking for volumes\n");
+#endif //WIN_DEBUG
         //map the drive to a volume letter
         DWORD driveLetters = 0;
         TCHAR currentLetter = 'A';
-        driveLetters = GetLogicalDrives();
+        uint32_t volumeCounter = 0;
+        driveLetters = GetLogicalDrives();//TODO: This will remount everything. If we can figure out a better way to do this, we should so that not everything is remounted. - TJE
         device->os_info.fileSystemInfo.fileSystemInfoValid = true;//Setting this since we have code here to detect the volumes in the OS
-        bool foundVolumeLetter = false;
-        while (driveLetters > 0 && !foundVolumeLetter)
+        uint8_t volIter = 0;
+        for (volIter = 0; volIter < MAX_VOL_BITS; ++volIter, ++currentLetter, ++volumeCounter)
         {
-            if (driveLetters & BIT0)
+            if (M_BitN(volIter) & driveLetters)
             {
                 //a volume with this letter exists...check it's physical device number
-                TCHAR volume_name[WIN_MAX_DEVICE_NAME_LENGTH] = { 0 };
+                DECLARE_ZERO_INIT_ARRAY(TCHAR, volume_name, MAX_VOL_STR_LEN);
                 TCHAR *ptrLetterName = &volume_name[0];
-                _stprintf_s(ptrLetterName, WIN_MAX_DEVICE_NAME_LENGTH, TEXT("\\\\.\\%c:"), currentLetter);
+                _sntprintf_s(ptrLetterName, MAX_VOL_STR_LEN, _TRUNCATE, TEXT("\\\\.\\%c:"), currentLetter);
                 HANDLE letterHandle = CreateFile(ptrLetterName,
                     GENERIC_WRITE | GENERIC_READ,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    NULL,
+                    M_NULLPTR,
                     OPEN_EXISTING,
 //#if !defined(WINDOWS_DISABLE_OVERLAPPED)
 //                    FILE_FLAG_OVERLAPPED,
 //#else
                     0,
 //#endif
-                    NULL);
+                    M_NULLPTR);
                 if (letterHandle != INVALID_HANDLE_VALUE)
                 {
                     DWORD returnedBytes = 0;
-                    DWORD maxExtents = 32;//https://technet.microsoft.com/en-us/library/cc772180(v=ws.11).aspx
-                    PVOLUME_DISK_EXTENTS diskExtents = NULL;
-                    DWORD diskExtentsSizeBytes = sizeof(VOLUME_DISK_EXTENTS) + (sizeof(DISK_EXTENT) * maxExtents);
-                    diskExtents = C_CAST(PVOLUME_DISK_EXTENTS, malloc(diskExtentsSizeBytes));
+                    DWORD maxExtents = MAX_DISK_EXTENTS;//https://technet.microsoft.com/en-us/library/cc772180(v=ws.11).aspx
+                    PVOLUME_DISK_EXTENTS diskExtents = M_NULLPTR;
+                    DWORD diskExtentsSizeBytes = C_CAST(DWORD, sizeof(VOLUME_DISK_EXTENTS) + (sizeof(DISK_EXTENT) * maxExtents));
+                    diskExtents = C_CAST(PVOLUME_DISK_EXTENTS, safe_malloc(diskExtentsSizeBytes));
                     if (diskExtents)
                     {
-                        if (DeviceIoControl(letterHandle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, diskExtents, diskExtentsSizeBytes, &returnedBytes, NULL))
+                        memset(diskExtents, 0, diskExtentsSizeBytes);
+                        if (DeviceIoControl(letterHandle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, M_NULLPTR, 0, diskExtents, diskExtentsSizeBytes, &returnedBytes, M_NULLPTR))
                         {
                             for (DWORD counter = 0; counter < diskExtents->NumberOfDiskExtents; ++counter)
                             {
                                 if (diskExtents->Extents[counter].DiskNumber == device->os_info.os_drive_number)
                                 {
-                                    foundVolumeLetter = true;
-                                    device->os_info.fileSystemInfo.hasFileSystem = true;//We found a filesystem for this drive, so set this to true.
-                                    //now we need to determine if this volume has the system directory on it.
-                                    CHAR systemDirectoryPath[4096] = { 0 };//4096 SHOULD be plenty...
+                                    device->os_info.fileSystemInfo.hasActiveFileSystem = true;//We found a filesystem for this drive, so set this to true.
 
-                                    if (GetSystemDirectoryA(systemDirectoryPath, 4096) > 0)
+                                    //Set a bit to note that this particular volume (letter) is on this device
+                                    device->os_info.volumeBitField |= (UINT32_C(1) << volumeCounter);
+
+                                    //now we need to determine if this volume has the system directory on it.
+                                    DECLARE_ZERO_INIT_ARRAY(TCHAR, systemDirectoryPath, MAX_PATH);
+
+                                    if (GetSystemDirectory(systemDirectoryPath, MAX_PATH) > 0)
                                     {
-                                        if (strlen(systemDirectoryPath) > 0)
+                                        if (_tcslen(systemDirectoryPath) > 0)
                                         {
                                             //we need to check only the first letter of the returned string since this is the volume letter
                                             if (systemDirectoryPath[0] == currentLetter)
@@ -3880,46 +4163,50 @@ static int get_Win_Device(const char *filename, tDevice *device )
                                                 device->os_info.fileSystemInfo.isSystemDisk = true;
                                             }
                                         }
-                                        #if defined (_DEBUG)
+#if defined (WIN_DEBUG)
                                         else
                                         {
                                             printf("\nWARNING! Asked for system directory, but got a zero length string! Unable to detect if this is a drive with a system folder!\n");
                                         }
-                                        #endif
+#endif //WIN_DEBUG
                                     }
-                                    break;
                                 }
                             }
                         }
                         //DWORD lastError = GetLastError();
-                        safe_Free(diskExtents)
+                        safe_free(M_REINTERPRET_CAST(void**, &diskExtents));
                     }
                 }
                 CloseHandle(letterHandle);
             }
-            driveLetters = driveLetters >> 1;//shift the bits by 1 and we will go onto the next drive letter
-            ++currentLetter;//increment the letter
         }
 
         //set the OS Type
         device->os_info.osType = OS_WINDOWS;
+#if defined (WIN_DEBUG)
+        printf("WIN: getting SCSI address\n");
+#endif //WIN_DEBUG
 
         // Lets get the SCSI address
         win_Get_SCSI_Address(device->os_info.fd, &device->os_info.scsi_addr);
-        
+
+#if defined (WIN_DEBUG)
+        printf("WIN: det adapter descriptor\n");
+#endif //WIN_DEBUG
         // Lets get some properties.
         win_ret = win_Get_Adapter_Descriptor(device->os_info.fd, &adapter_desc);
 
         if (win_ret == SUCCESS)
         {
             // TODO: Copy any of the adapter stuff.
-#if defined (_DEBUG)
+#if defined (WIN_DEBUG)
             printf("Adapter BusType: ");
             print_bus_type(adapter_desc->BusType);
             printf(" \n");
-#endif
+#endif //WIN_DEBUG
             //saving max transfer size (in bytes)
             device->os_info.adapterMaxTransferSize = adapter_desc->MaximumTransferLength;
+
 
             //saving the SRB type so that we know when an adapter supports the new SCSI Passthrough EX IOCTLS - TJE
 #if WINVER >= SEA_WIN32_WINNT_WIN8 //If this check is wrong, make sure minGW is properly defining WINVER in the makefile.
@@ -3933,36 +4220,53 @@ static int get_Win_Device(const char *filename, tDevice *device )
                 device->os_info.srbtype = SRB_TYPE_SCSI_REQUEST_BLOCK;
             }
             device->os_info.minimumAlignment = C_CAST(uint8_t, adapter_desc->AlignmentMask + 1);
-            device->os_info.alignmentMask = C_CAST(int, adapter_desc->AlignmentMask);//may be needed later....currently unused
+            device->os_info.alignmentMask = adapter_desc->AlignmentMask;//may be needed later....currently unused
+#if defined (WIN_DEBUG)
+            printf("WIN: get device descriptor\n");
+#endif //WIN_DEBUG
             win_ret = win_Get_Device_Descriptor(device->os_info.fd, &device_desc);
-            if(win_ret == SUCCESS)
+            if (win_ret == SUCCESS)
             {
                 bool checkForCSMI = false;
                 bool checkForNVMe = false;
-                int fwdlResult = NOT_SUPPORTED;
+                eReturnValues fwdlResult = NOT_SUPPORTED;
+
+                //save the bus types to the tDevice struct since they may be helpful in certain debug scenarios
+                device->os_info.adapterDescBusType = adapter_desc->BusType;
+                device->os_info.deviceDescBusType = C_CAST(uint8_t, device_desc->BusType);//NOTE: This enum seems to be a byte in definition today, but if we run into future issues, we may need to change it. - TJE
+#if defined (WIN_DEBUG)
+                printf("WIN: get adapter IDs (VID/PID for USB or PCIe)\n");
+#endif //WIN_DEBUG
                 get_Adapter_IDs(device, device_desc, device_desc->Size);
 
-#if WINVER >= SEA_WIN32_WINNT_WINBLUE
+#if WINVER >= SEA_WIN32_WINNT_WINBLUE && defined (IOCTL_SCSI_MINIPORT_FIRMWARE)
+#if defined (WIN_DEBUG)
+                printf("WIN: Get MiniPort FWDL capabilities\n");
+#endif //WIN_DEBUG
                 fwdlResult = get_Win_FWDL_Miniport_Capabilities(device, device_desc->BusType == BusTypeNvme ? true : false);
 #endif
 
 #if WINVER >= SEA_WIN32_WINNT_WIN10
                 if (fwdlResult != SUCCESS)
                 {
+#if defined (WIN_DEBUG)
+                    printf("WIN: get Win10 FWDL support\n");
+#endif //WIN_DEBUG
                     get_Windows_FWDL_IO_Support(device, device_desc->BusType);
                 }
 #else
+                M_USE_UNUSED(fwdlResult);
                 device->os_info.fwdlIOsupport.fwdlIOSupported = false;//this API is not available before Windows 10
 #endif
-                #if defined (_DEBUG)
+#if defined (WIN_DEBUG)
                 printf("Drive BusType: ");
                 print_bus_type(device_desc->BusType);
                 printf(" \n");
-                #endif
+#endif //WIN_DEBUG
 
                 if (device_desc->BusType == BusTypeUnknown)//Add other device types that can't be handled with other methods of SCSI or ATA passthrough among other options below.
                 {
-                    //TODO: Need a special case to handle unknown device types!
+                    //special case to handle unknown device types!
                     device->drive_info.drive_type = SCSI_DRIVE;
                     device->drive_info.interface_type = SCSI_INTERFACE;
                     device->os_info.ioType = WIN_IOCTL_BASIC;
@@ -3982,6 +4286,9 @@ static int get_Win_Device(const char *filename, tDevice *device )
                     device->drive_info.drive_type = ATA_DRIVE;
                     device->drive_info.interface_type = IDE_INTERFACE;
                     device->os_info.ioType = WIN_IOCTL_ATA_PASSTHROUGH;
+#if defined (WIN_DEBUG)
+                    printf("WIN: get SMART IO support ATA\n");
+#endif //WIN_DEBUG
                     get_Windows_SMART_IO_Support(device);//might be used later
                     checkForCSMI = true;
                 }
@@ -3993,14 +4300,17 @@ static int get_Win_Device(const char *filename, tDevice *device )
                     device->drive_info.interface_type = IDE_INTERFACE;
                     device->drive_info.passThroughHacks.someHacksSetByOSDiscovery = true;
                     device->drive_info.passThroughHacks.ataPTHacks.a1NeverSupported = true;//This is GENERALLY true because almost all times the CDB is passed through instead of translated for a passthrough command, so just block it no matter what.
-                    //TODO: These devices use the SCSI MMC command set in packet commands over ATA...other than for a few other commands.
+                    //These devices use the SCSI MMC command set in packet commands over ATA...other than for a few other commands.
                     //If we care to properly support this, we should investigate either how to send a packet command, or we should try issuing only SCSI commands
                     device->os_info.ioType = WIN_IOCTL_SCSI_PASSTHROUGH;
+#if defined (WIN_DEBUG)
+                    printf("WIN: get SMART IO support ATAPI\n");
+#endif //WIN_DEBUG
                     get_Windows_SMART_IO_Support(device);//might be used later
                 }
                 else if (device_desc->BusType == BusTypeSata)
                 {
-                    if (strncmp(WIN_CDROM_DRIVE, filename, strlen(WIN_CDROM_DRIVE)) == 0)
+                    if (strncmp(WIN_CDROM_DRIVE, filename, safe_strlen(WIN_CDROM_DRIVE)) == 0)
                     {
                         device->drive_info.drive_type = ATAPI_DRIVE;
                     }
@@ -4014,6 +4324,9 @@ static int get_Win_Device(const char *filename, tDevice *device )
                     device->os_info.ioType = WIN_IOCTL_SCSI_PASSTHROUGH;
                     device->drive_info.passThroughHacks.someHacksSetByOSDiscovery = true;
                     device->drive_info.passThroughHacks.ataPTHacks.a1NeverSupported = true;
+#if defined (WIN_DEBUG)
+                    printf("WIN: get SMART IO support SATA\n");
+#endif //WIN_DEBUG
                     get_Windows_SMART_IO_Support(device);//might be used later
                 }
                 else if (device_desc->BusType == BusTypeUsb)
@@ -4030,49 +4343,91 @@ static int get_Win_Device(const char *filename, tDevice *device )
                     device->drive_info.interface_type = IEEE_1394_INTERFACE;
                     device->os_info.ioType = WIN_IOCTL_SCSI_PASSTHROUGH;
                 }
-#if !defined(DISABLE_NVME_PASSTHROUGH)
                 //NVMe bustype can be defined for Win7 with openfabrics nvme driver, so make sure we can handle it...it shows as a SCSI device on this interface unless you use a SCSI?: handle with the IOCTL directly to the driver.
                 else if (device_desc->BusType == BusTypeNvme)
                 {
                     device->drive_info.namespaceID = device->os_info.scsi_addr.Lun + 1;
                     if (device_desc->VendorIdOffset)//Open fabrics will set a vendorIDoffset, MSFT driver will not.
                     {
+#if defined (WIN_DEBUG)
+                        printf("WIN: checking for additional NVMe driver interfaces\n");
+#endif //WIN_DEBUG
                         if (device->os_info.scsiSRBHandle != INVALID_HANDLE_VALUE || SUCCESS == open_SCSI_SRB_Handle(device))
                         {
                             //now see if the IOCTL is supported or not
 #if defined (ENABLE_OFNVME) || defined (ENABLE_INTEL_RST)
                             //if defined hell since we can flag these interfaces on and off
-    #if defined (ENABLE_OFNVME)
-                            if (supports_OFNVME_IO(device->os_info.scsiSRBHandle))
+                            bool foundNVMePassthrough = false;
+#if defined (ENABLE_OFNVME)
+#if defined (WIN_DEBUG)
+                            printf("WIN: checking for open fabrics NVMe IOCTL\n");
+#endif //WIN_DEBUG
+                            if (!foundNVMePassthrough && supports_OFNVME_IO(device->os_info.scsiSRBHandle))
                             {
                                 //congratulations! nvme commands can be passed through!!!
                                 device->os_info.openFabricsNVMePassthroughSupported = true;
                                 device->drive_info.drive_type = NVME_DRIVE;
                                 device->drive_info.interface_type = NVME_INTERFACE;
                                 device->os_info.osReadWriteRecommended = true;//setting this so that read/write LBA functions will call Windows functions when possible for this.
-                                //TODO: Setup limited passthrough capabilities structure???
+                                foundNVMePassthrough = true;
+                                //This is set because asking for list of pages + subpages returns a list wihtout them, so it is interpretted wrong.
+                                //It returns the data for list of pages WITHOUT subpages, so CDB is not validated correctly.
+                                //It is possible that other drivers based on ofnvme work different, but I don't have any others to test. Tested using the latest version before it stopped receiving support-TJE
+                                //Code in ofnvme 1.5 does not properly validate if log subpages or mode subpages are requested and returns the incorrect data.
+                                //setup some flags for everything else though based on what is in the translation code.
+                                device->drive_info.passThroughHacks.scsiHacks.noLogSubPages = true;
+                                device->drive_info.passThroughHacks.scsiHacks.noModeSubPages = true;
+                                device->drive_info.passThroughHacks.scsiHacks.readWrite.available = true;
+                                device->drive_info.passThroughHacks.scsiHacks.readWrite.rw6 = true;
+                                device->drive_info.passThroughHacks.scsiHacks.readWrite.rw10 = true;
+                                device->drive_info.passThroughHacks.scsiHacks.readWrite.rw12 = true;
+                                device->drive_info.passThroughHacks.scsiHacks.readWrite.rw16 = true;
+                                device->drive_info.passThroughHacks.scsiHacks.noReportSupportedOperations = true;
+                                device->drive_info.passThroughHacks.scsiHacks.securityProtocolSupported = true;//depending on if this is uncommented or not in the compiled driver, it may or may not work, but code seems to have some knowledge of this translation in some cases.-TJE
+                                device->drive_info.passThroughHacks.scsiHacks.noSATVPDPage = true;
+
+#if defined (WIN_DEBUG)
+                                printf("WIN: open fabrics NVMe supported\n");
+#endif //WIN_DEBUG
                             }
-    #if !defined (ENABLE_INTEL_RST)
-                            else
-    #endif //!ENABLE_INTEL_RST
-    #endif //ENABLE_OFNVME
-    #if defined (ENABLE_OFNVME)
-                            else
-    #endif//ENABLE_OFNVME
-    #if defined (ENABLE_INTEL_RST)
-                            //TODO: else if(/*check for Intel RST CSMI support*/)
-                            if (device_Supports_CSMI_With_RST(device->os_info.scsiSRBHandle))
+#endif //ENABLE_OFNVME
+#if defined (ENABLE_INTEL_RST)
+#if defined (WIN_DEBUG)
+                            printf("WIN: Checking for Intel CSMI + RST NVMe support\n");
+#endif //WIN_DEBUG
+                            if (!foundNVMePassthrough && device_Supports_CSMI_With_RST(device))
                             {
-                                //TODO: setup CSMI structure
                                 device->drive_info.drive_type = NVME_DRIVE;
                                 device->drive_info.interface_type = NVME_INTERFACE;
                                 device->os_info.intelNVMePassthroughSupported = true;
+                                foundNVMePassthrough = true;
+                                device->drive_info.passThroughHacks.someHacksSetByOSDiscovery = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedPassthroughCapabilities = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.identifyGeneric = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.identifyController = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.identifyNamespace = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.getLogPage = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.getFeatures = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.setFeatures = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.firmwareCommit = true;//NOTE: Always requires a reboot for activation even when error code does not indicate this
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.firmwareDownload = true;
+                                //supported features: power management, temperature threshold, APST, HCTM (17.2+), vendor specific.
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.vendorUnique = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.deviceSelfTest = true;//not documented, but found with trial and error.
+                                //NOTE: some of this comes from an intel document and some comes from trial and error.
+                                //      It is extremely likely that the supported commands vary by driver version, but we do not have that level of detail to populate this list at this time-TJE
+                                
+#if defined (WIN_DEBUG)
+                                printf("WIN: Intel CSMI + NVMe supported\n");
+#endif //WIN_DEBUG
                             }
-    #endif//ENABLE_INTEL_RST
-                            
-                            else
+#endif//ENABLE_INTEL_RST
+                            if (!foundNVMePassthrough)
 #endif //ENABLE_OFNVME || ENABLE_INTEL_RST
                             {
+#if defined (WIN_DEBUG)
+                                printf("WIN: no NVMe passthrough found\n");
+#endif //WIN_DEBUG
                                 //unable to do passthrough, and isn't in normal Win10 mode, this means it's some other driver that we don't know how to use. Treat as SCSI
                                 device->os_info.intelNVMePassthroughSupported = false;
                                 device->os_info.openFabricsNVMePassthroughSupported = false;
@@ -4083,6 +4438,9 @@ static int get_Win_Device(const char *filename, tDevice *device )
                         }
                         else
                         {
+#if defined (WIN_DEBUG)
+                            printf("WIN: treat as SCSI. Closing SCSI SRB handle\n");
+#endif //WIN_DEBUG
                             //close the handle that was opened. TODO: May need to remove this in the future.
                             close_SCSI_SRB_Handle(device);
                             device->os_info.intelNVMePassthroughSupported = false;
@@ -4096,11 +4454,18 @@ static int get_Win_Device(const char *filename, tDevice *device )
                     else
                     {
 #if WINVER >= SEA_WIN32_WINNT_WIN10 
+#if defined (WIN_DEBUG)
+                        printf("WIN: Checking Win version for NVMe IOCTL support level\n");
+#endif //WIN_DEBUG
                         if (is_Windows_10_Or_Higher())
                         {
+#if defined (WIN_DEBUG)
+                            printf("WIN: Win10+\n");
+#endif //WIN_DEBUG
                             device->drive_info.drive_type = NVME_DRIVE;
                             device->drive_info.interface_type = NVME_INTERFACE;
                             device->os_info.osReadWriteRecommended = true;//setting this so that read/write LBA functions will call Windows functions when possible for this, althrough SCSI Read/write 16 will work too!
+                            device->drive_info.passThroughHacks.someHacksSetByOSDiscovery = true;
                             device->drive_info.passThroughHacks.nvmePTHacks.limitedPassthroughCapabilities = true;
                             device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.firmwareCommit = true;
                             device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.firmwareDownload = true;
@@ -4109,16 +4474,48 @@ static int get_Win_Device(const char *filename, tDevice *device )
                             device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.identifyController = true;
                             device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.identifyNamespace = true;
                             device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.vendorUnique = true;
+#if defined (ENABLE_TRANSLATE_FORMAT)
+                            if (is_Windows_10_Version_1607_Or_Higher())
+                            {
+                                if ((device->os_info.fileSystemInfo.fileSystemInfoValid && !device->os_info.fileSystemInfo.isSystemDisk) || is_Windows_PE())
+                                {
+                                    device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.formatCryptoSecureErase = true;
+                                }
+                            }
+#endif //ENABLE_TRANSLATE_FORMAT
                             if (is_Windows_10_Version_1903_Or_Higher())
                             {
+#if defined (WIN_DEBUG)
+                                printf("WIN: 1903+\n");
+#endif //WIN_DEBUG
                                 //this is definitely blocked in 1809, so this seems to have started being available in 1903
-                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.deviceSelfTest = true;//NOTE: probably specific to a certain Win10 update. Not clearly documented when this became available, so need to do some testing before this is perfect
+                                //NOTE: probably specific to a certain Win10 update. Not clearly documented when this became available, so need to do some testing before this is perfect
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.deviceSelfTest = true;
+#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
+                                if ((device->os_info.fileSystemInfo.fileSystemInfoValid && !device->os_info.fileSystemInfo.isSystemDisk))
+                                {
+                                    //Which is possible depends on the drive's capabilities. The IOCTL_STORAGE_REINITIALIZE_MEDIA changes behanvrio based on OS version and drive capabilities.
+#if defined (ENABLE_TRANSLATE_FORMAT)
+                                    device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.formatCryptoSecureErase = true;
+#endif //ENABLE_TRANSLATE_FORMAT
+                                    //NOTE: Cannot do format with user erase because that is not what MSFT translates for the Sanitize block erase...it just does sanitize block erase.
+                                    //      No idea when this was implemented because the documentation on this translation is non-existent right now.
+                                    //NOTE: It is not clear if sanitize crypto was switched to starting in 1903 or if it was an earlier version. The documentation only goes back to 1903 online.-TJE
+                                    device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.sanitizeCrypto = true;
+                                }
+#endif //WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
                             }
                             device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.securityReceive = true;
                             device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.securitySend = true;
                             device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.setFeatures = true;//Only 1 feature today. <--this is old. There is now a set features API, but I don't see what it does or does not allow. Still needs implementing. - TJE
+#if defined (WIN_DEBUG)
+                            printf("WIN: Checking for Win PE\n");
+#endif //WIN_DEBUG
                             if (is_Windows_PE())
                             {
+#if defined (WIN_DEBUG)
+                                printf("WIN: PE environment found\n");
+#endif //WIN_DEBUG
                                 //If in Windows PE, then these other commands become available
                                 device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.namespaceAttachment = true;
                                 device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.namespaceManagement = true;
@@ -4126,16 +4523,33 @@ static int get_Win_Device(const char *filename, tDevice *device )
                                 device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.miReceive = true;
                                 device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.miSend = true;
                                 device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.sanitize = true;
+                                //adding more detail since the previous bool was a little too generic and this will improve overall accuracy of supported commands-TJE
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.sanitizeCrypto = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.sanitizeBlock = true;
+                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.sanitizeOverwrite = true;
                             }
-                            if (is_Windows_11_Version_21H2_Or_Higher)
+                            if (is_Windows_10_Version_21H1_Or_Higher())
                             {
-                                //New documentation indicates that sanitize is supported wihtout PE mode in Windows 11.
-                                device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.sanitize = true;
+#if defined (WIN_DEBUG)
+                                printf("WIN: 21H1+\n");
+#endif //WIN_DEBUG
+#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_20348
+                                if ((device->os_info.fileSystemInfo.fileSystemInfoValid && !device->os_info.fileSystemInfo.isSystemDisk))
+                                {
+                                    //Microsoft's documentation was wrong or just worded weirdly that it seemeed like it should work in Win11 just like PE, but that is not the case!
+                                    //The only way that seems to actually work is PE as always or the reinitialize media IOCTL which is slightly more limited in capabilities.
+                                    device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.sanitizeCrypto = true;
+                                    device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.sanitizeBlock = true;
+                                }
+#endif //#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_20348
                             }
                         }
                         else
 #endif //WINVER >= SEA_WIN32_WINNT_WIN10 
                         {
+#if defined (WIN_DEBUG)
+                            printf("WIN: earlier Windows. Treating as SCSI\n");
+#endif //WIN_DEBUG
                             device->drive_info.drive_type = SCSI_DRIVE;
                             device->drive_info.interface_type = SCSI_INTERFACE;
                             device->os_info.ioType = WIN_IOCTL_SCSI_PASSTHROUGH;
@@ -4144,7 +4558,6 @@ static int get_Win_Device(const char *filename, tDevice *device )
                     }
 
                 }
-#endif //!defined(DISABLE_NVME_PASSTHROUGH)
                 else //treat anything else as a SCSI device.
                 {
                     device->drive_info.interface_type = SCSI_INTERFACE;
@@ -4159,6 +4572,9 @@ static int get_Win_Device(const char *filename, tDevice *device )
                     }
                     else if (device_desc->BusType == BusTypeRAID)
                     {
+#if defined (WIN_DEBUG)
+                        printf("WIN: RAID bus type. Need to check for additional NVMe/CSMI support\n");
+#endif //WIN_DEBUG
                         //TODO: Need to figure out a better way to decide this.
                         //      Unfortunately, the Intel RST driver will show NVMe drives as RAID, but no vendor ID, so we need to check them all for this until we can find something else to use.
                         //      This means issuing an admin identify which should fail gracefully on drivers that don't actually support this since it's vendor unique IOCTL code and signature.
@@ -4176,8 +4592,10 @@ static int get_Win_Device(const char *filename, tDevice *device )
                 }
 
                 //For now force direct IO all the time to match previous functionality.
-                //TODO: Investigate how to decide using double buffered vs direct vs mixed.
+                //Investigate how to decide using double buffered vs direct vs mixed.
                 //Note: On a couple systems here, when using double buffered IO with ATA Pass-through, invalid checksums are returned for identify commands, but direct is fine...
+                //Also observed that certain command data is cached in double buffered mode, but not direct mode, which is an issue for our utilities
+                //This is the other reason to force direct, even though the code otherwise supports double buffered IO
                 device->os_info.ioMethod = WIN_IOCTL_FORCE_ALWAYS_DIRECT;
 
                 if (device->dFlags & OPEN_HANDLE_ONLY)//This is this far down because there is a lot of other things that need to be saved in order for windows pass-through to work correctly.
@@ -4185,10 +4603,12 @@ static int get_Win_Device(const char *filename, tDevice *device )
                     return SUCCESS;
                 }
 
-#if !defined (DISABLE_NVME_PASSTHROUGH)
                 if (checkForNVMe)
                 {
-                    uint8_t nvmeIdent[4096] = { 0 };
+                    DECLARE_ZERO_INIT_ARRAY(uint8_t, nvmeIdent, 4096);
+#if defined (WIN_DEBUG)
+                    printf("WIN: Additional check for Intel NVMe\n");
+#endif //WIN_DEBUG
                     if (device->os_info.scsiSRBHandle != INVALID_HANDLE_VALUE || SUCCESS == open_SCSI_SRB_Handle(device))
                     {
                         //Check for Intel NVMe passthrough
@@ -4200,21 +4620,42 @@ static int get_Win_Device(const char *filename, tDevice *device )
                             //use OS read/write calls since this driver may not allow these to work since it is limited in capabilities for passthrough.
                             device->os_info.osReadWriteRecommended = true;
                             checkForCSMI = false;
+#if defined (WIN_DEBUG)
+                            printf("WIN: Intel NVMe support found\n");
+#endif //WIN_DEBUG
                             //TODO: This passthrough may be limited in commands allowed to be sent. If this is limited, need to fill in the nvme hacks to show what is or is not supported.
+                            device->drive_info.passThroughHacks.someHacksSetByOSDiscovery = true;
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedPassthroughCapabilities = true;
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.identifyGeneric = true;
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.identifyController = true;
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.identifyNamespace = true;
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.getLogPage = true;
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.getFeatures = true;
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.setFeatures = true;
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.firmwareCommit = true;//NOTE: Always requires a reboot for activation even when error code does not indicate this
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.firmwareDownload = true;
+                            //supported features: power management, temperature threshold, APST, HCTM (17.2+), vendor specific.
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.vendorUnique = true;
+                            device->drive_info.passThroughHacks.nvmePTHacks.limitedCommandsSupported.deviceSelfTest = true;//not documented, but found with trial and error.
+                            //NOTE: some of this comes from an intel document and some comes from trial and error.
+                            //      It is extremely likely that the supported commands vary by driver version, but we do not have that level of detail to populate this list at this time-TJE
                         }
                         else
                         {
+#if defined (WIN_DEBUG)
+                            printf("WIN: Does not support Intel NVMe passthrough\n");
+#endif //WIN_DEBUG
                             device->drive_info.drive_type = SCSI_DRIVE;
                             device->drive_info.interface_type = SCSI_INTERFACE;
                             device->os_info.intelNVMePassthroughSupported = false;
                         }
                     }
                 }
-#endif
 
                 // Lets fill out rest of info
-                //TODO: This doesn't work for ATAPI on Windows right now. Will need to debug it more to figure out what other parts are wrong to get it fully functional.
-                //This won't be easy since ATAPI is a weird SCSI over ATA hybrid-TJE
+#if defined (WIN_DEBUG)
+                printf("WIN: filling device information\n");
+#endif //WIN_DEBUG
                 ret = fill_Drive_Info_Data(device);
 
                 /*
@@ -4223,6 +4664,9 @@ static int get_Win_Device(const char *filename, tDevice *device )
                 */
                 if ((ret != SUCCESS) && (device->drive_info.interface_type == IDE_INTERFACE))
                 {
+#if defined (WIN_DEBUG)
+                    printf("WIN: Working around legacy passthrough issues\n");
+#endif //WIN_DEBUG
                     //we weren't successful getting device information...so now try switching to the other IOCTLs
                     if (device->os_info.ioType == WIN_IOCTL_SCSI_PASSTHROUGH || device->os_info.ioType == WIN_IOCTL_SCSI_PASSTHROUGH_EX)
                     {
@@ -4239,8 +4683,8 @@ static int get_Win_Device(const char *filename, tDevice *device )
                         bool idePassThroughSupported = false;
                         //test an identify command with IDE pass-through
                         device->os_info.ioType = WIN_IOCTL_IDE_PASSTHROUGH_ONLY;
-                        //TODO: use check power mode command instead?
-                        if (SUCCESS == ata_Identify(device, (uint8_t *)&device->drive_info.IdentifyData.ata.Word000, sizeof(tAtaIdentifyData)) || SUCCESS == ata_Identify_Packet_Device(device, (uint8_t *)&device->drive_info.IdentifyData.ata.Word000, sizeof(tAtaIdentifyData)))
+                        //Try an identify command. Should we use check power mode command instead???
+                        if (SUCCESS == ata_Identify(device, C_CAST(uint8_t *, &device->drive_info.IdentifyData.ata.Word000), sizeof(tAtaIdentifyData)) || SUCCESS == ata_Identify_Packet_Device(device, C_CAST(uint8_t *, &device->drive_info.IdentifyData.ata.Word000), sizeof(tAtaIdentifyData)))
                         {
                             idePassThroughSupported = true;
                         }
@@ -4260,14 +4704,23 @@ static int get_Win_Device(const char *filename, tDevice *device )
 
                 if (checkForCSMI)
                 {
-                    if (device->os_info.scsiSRBHandle != INVALID_HANDLE_VALUE  || SUCCESS == open_SCSI_SRB_Handle(device))
+#if defined (WIN_DEBUG)
+                    printf("WIN: Additional CSMI check\n");
+#endif //WIN_DEBUG
+                    if (device->os_info.scsiSRBHandle != INVALID_HANDLE_VALUE || SUCCESS == open_SCSI_SRB_Handle(device))
                     {
+#if defined (WIN_DEBUG)
+                        printf("WIN: Looking for CSMI IO support\n");
+#endif //WIN_DEBUG
                         if (handle_Supports_CSMI_IO(device->os_info.scsiSRBHandle, device->deviceVerbosity))
                         {
+#if defined (WIN_DEBUG)
+                            printf("WIN: Setting up CSMI capabilities\n");
+#endif //WIN_DEBUG
                             //open up the CSMI handle and populate the pointer to the csmidata structure. This may allow us to work around other commands.
                             if (SUCCESS == jbod_Setup_CSMI_Info(device->os_info.scsiSRBHandle, device, 0, device->os_info.scsi_addr.PortNumber, device->os_info.scsi_addr.PathId, device->os_info.scsi_addr.TargetId, device->os_info.scsi_addr.Lun))
                             {
-                                //TODO: Set flags, or other info?
+                                //Set flags, or other info?
                             }
                         }
                     }
@@ -4308,9 +4761,9 @@ static int get_Win_Device(const char *filename, tDevice *device )
                     //do nothing since we assume everything else was set correctly earlier
                     break;
                 }
-                safe_Free(device_desc)
+                safe_free_device_descriptor(&device_desc);
             }
-            safe_Free(adapter_desc)
+            safe_free_adapter_descriptor(&adapter_desc);
         }
     }
     // Just in case we bailed out in any way.
@@ -4319,7 +4772,7 @@ static int get_Win_Device(const char *filename, tDevice *device )
     //printf("%s <--\n",__FUNCTION__);
     return ret;  //if we didn't get to fill_In_Device_Info FAILURE
 }
-int get_Device(const char *filename, tDevice *device)
+eReturnValues get_Device(const char *filename, tDevice *device)
 {
 #if defined (ENABLE_CSMI)
     //check is the handle is in the format of a CSMI device handle so we can open the csmi device properly.
@@ -4351,21 +4804,38 @@ int get_Device(const char *filename, tDevice *device)
 //!   \return SUCCESS - pass, !SUCCESS fail or something went wrong
 //
 //-----------------------------------------------------------------------------
-int get_Device_Count(uint32_t * numberOfDevices, uint64_t flags)
+eReturnValues get_Device_Count(uint32_t * numberOfDevices, uint64_t flags)
 {
-    HANDLE fd = NULL;
-    TCHAR deviceName[WIN_MAX_DEVICE_NAME_LENGTH] = { 0 };
-    ptrRaidHandleToScan raidHandleList = NULL;
+    HANDLE fd = M_NULLPTR;
+    DECLARE_ZERO_INIT_ARRAY(TCHAR, deviceName, WIN_MAX_DEVICE_NAME_LENGTH);
+    ptrRaidHandleToScan raidHandleList = M_NULLPTR;
     ptrRaidHandleToScan beginRaidHandleList = raidHandleList;
     //Configuration manager library is not available on ARM for Windows. Library didn't exist when I went looking for it - TJE
     //ARM requires 10.0.16299.0 API to get cfgmgr32 library!
-    //TODO: add better check for API version and ARM to turn this on and off.
     //try forcing a system rescan before opening the list. This should help with crappy drivers or bad hotplug support - TJE
+    eVerbosityLevels winCountVerbosity = VERBOSITY_DEFAULT;
+    if (flags & GET_DEVICE_FUNCS_VERBOSE_COMMAND_NAMES)
+    {
+        winCountVerbosity = VERBOSITY_COMMAND_NAMES;
+    }
+    if (flags & GET_DEVICE_FUNCS_VERBOSE_COMMAND_VERBOSE)
+    {
+        winCountVerbosity = VERBOSITY_COMMAND_VERBOSE;
+    }
+    if (flags & GET_DEVICE_FUNCS_VERBOSE_BUFFERS)
+    {
+        winCountVerbosity = VERBOSITY_BUFFERS;
+    }
+
     if (flags & BUS_RESCAN_ALLOWED)
     {
         DEVINST deviceInstance;
-        DEVINSTID tree = NULL;//set to null for root of device tree
+        DEVINSTID tree = M_NULLPTR;//set to null for root of device tree
         ULONG locateNodeFlags = 0;//add flags here if we end up needing them
+        if (VERBOSITY_COMMAND_NAMES <= winCountVerbosity)
+        {
+            printf("Running CM_Locate_Devnode on root to force system wide rescan\n");
+        }
         if (CR_SUCCESS == CM_Locate_DevNode(&deviceInstance, tree, locateNodeFlags))
         {
             ULONG reenumerateFlags = 0;
@@ -4373,7 +4843,9 @@ int get_Device_Count(uint32_t * numberOfDevices, uint64_t flags)
         }
     }
 
-    uint32_t driveNumber = 0, found = 0;
+    uint32_t driveNumber = 0;
+
+    uint32_t found = 0;
     for (driveNumber = 0; driveNumber < MAX_DEVICES_TO_SCAN; ++driveNumber)
     {
         _stprintf_s(deviceName, WIN_MAX_DEVICE_NAME_LENGTH, TEXT("%s%u"), TEXT(WIN_PHYSICAL_DRIVE), driveNumber);
@@ -4381,33 +4853,41 @@ int get_Device_Count(uint32_t * numberOfDevices, uint64_t flags)
         fd = CreateFile(deviceName,
                         GENERIC_WRITE | GENERIC_READ, //FILE_ALL_ACCESS,
                         FILE_SHARE_READ | FILE_SHARE_WRITE,
-                        NULL,
+                        M_NULLPTR,
                         OPEN_EXISTING,
 #if !defined(WINDOWS_DISABLE_OVERLAPPED)
                         FILE_FLAG_OVERLAPPED,
 #else
                         0,
 #endif
-                        NULL);
+                        M_NULLPTR);
         if (fd != INVALID_HANDLE_VALUE)
         {
             ++found;
             //Check if the interface is reported as RAID from adapter data because an additional scan for RAID devices will be needed.
-            PSTORAGE_ADAPTER_DESCRIPTOR adapterData = NULL;
+            PSTORAGE_ADAPTER_DESCRIPTOR adapterData = M_NULLPTR;
             if (SUCCESS == win_Get_Adapter_Descriptor(fd, &adapterData))
             {
                 if (adapterData->BusType == BusTypeRAID)
                 {
+                    if (VERBOSITY_COMMAND_NAMES <= winCountVerbosity)
+                    {
+                        _tprintf_s(TEXT("Detected RAID adapter: %s\n"), deviceName);
+                    }
                     //get the SCSI address for this device and save it to the RAID handle list so it can be scanned for additional types of RAID interfaces.
                     SCSI_ADDRESS scsiAddress;
                     memset(&scsiAddress, 0, sizeof(SCSI_ADDRESS));
                     if (SUCCESS == win_Get_SCSI_Address(fd, &scsiAddress))
                     {
-                        char raidHandle[15] = { 0 };
+                        DECLARE_ZERO_INIT_ARRAY(char, raidHandle, RAID_HANDLE_STRING_MAX_LEN);
                         raidTypeHint raidHint;
                         memset(&raidHint, 0, sizeof(raidTypeHint));
-                        raidHint.unknownRAID = true;//TODO: Find a better way to hint at what type of raid we thing this might be. Can look at T10 vendor ID, low-level PCI/PCIe identifiers, etc.
-                        snprintf(raidHandle, 15, "\\\\.\\SCSI%" PRIu8 ":", scsiAddress.PortNumber);
+                        raidHint.unknownRAID = true;//TODO: Look up driver name to set hint instead of unknown to prevent excess IOCTLs being sent from retries.
+                        snprintf(raidHandle, RAID_HANDLE_STRING_MAX_LEN, "\\\\.\\SCSI%" PRIu8 ":", scsiAddress.PortNumber);
+                        if (VERBOSITY_COMMAND_NAMES <= winCountVerbosity)
+                        {
+                            printf("Adding SCSI port handle to RAID list to check for compatible devices: %s\n", raidHandle);
+                        }
                         raidHandleList = add_RAID_Handle_If_Not_In_List(beginRaidHandleList, raidHandleList, raidHandle, raidHint);
                         if (!beginRaidHandleList)
                         {
@@ -4416,7 +4896,7 @@ int get_Device_Count(uint32_t * numberOfDevices, uint64_t flags)
                     }
                 }
             }
-            safe_Free(adapterData)
+            safe_free_adapter_descriptor(&adapterData);
             CloseHandle(fd);
         }
     }
@@ -4427,11 +4907,15 @@ int get_Device_Count(uint32_t * numberOfDevices, uint64_t flags)
     if (!(flags & GET_DEVICE_FUNCS_IGNORE_CSMI))//check whether they want CSMI devices or not
     {
         uint32_t csmiDeviceCount = 0;
-        int csmiRet = get_CSMI_RAID_Device_Count(&csmiDeviceCount, flags, &beginRaidHandleList);
+        eReturnValues csmiRet = get_CSMI_RAID_Device_Count(&csmiDeviceCount, flags, &beginRaidHandleList);
         if (csmiRet == SUCCESS)
         {
             *numberOfDevices += csmiDeviceCount;
         }
+    }
+    else if (VERBOSITY_COMMAND_NAMES <= winCountVerbosity)
+    {
+        printf("CSMI Raid scan was skipped due to flag\n");
     }
 #endif
 
@@ -4466,19 +4950,34 @@ int get_Device_Count(uint32_t * numberOfDevices, uint64_t flags)
 //!                     Validate that it's drive_type is not UNKNOWN_DRIVE, !SUCCESS fail or something went wrong
 //
 //-----------------------------------------------------------------------------
-int get_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versionBlock ver, uint64_t flags)
+eReturnValues get_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versionBlock ver, uint64_t flags)
 {
-    int returnValue = SUCCESS;
+    eReturnValues returnValue = SUCCESS;
     uint32_t numberOfDevices = 0;
-    uint32_t driveNumber = 0, found = 0, failedGetDeviceCount = 0, permissionDeniedCount = 0;
-    TCHAR deviceName[WIN_MAX_DEVICE_NAME_LENGTH] = { 0 };
-    char    name[WIN_MAX_DEVICE_NAME_LENGTH] = { 0 }; //Because get device needs char
+    uint32_t driveNumber = 0;
+    uint32_t found = 0;
+    uint32_t failedGetDeviceCount = 0;
+    uint32_t permissionDeniedCount = 0;
+    DECLARE_ZERO_INIT_ARRAY(TCHAR, deviceName, WIN_MAX_DEVICE_NAME_LENGTH);
+    DECLARE_ZERO_INIT_ARRAY(char, name, WIN_MAX_DEVICE_NAME_LENGTH); //Because get device needs char
     HANDLE fd = INVALID_HANDLE_VALUE;
-    tDevice * d = NULL;
-    ptrRaidHandleToScan raidHandleList = NULL;
+    tDevice * d = M_NULLPTR;
+    ptrRaidHandleToScan raidHandleList = M_NULLPTR;
     ptrRaidHandleToScan beginRaidHandleList = raidHandleList;
+    eVerbosityLevels winListVerbosity = VERBOSITY_DEFAULT;
+    if (flags & GET_DEVICE_FUNCS_VERBOSE_COMMAND_NAMES)
+    {
+        winListVerbosity = VERBOSITY_COMMAND_NAMES;
+    }
+    if (flags & GET_DEVICE_FUNCS_VERBOSE_COMMAND_VERBOSE)
+    {
+        winListVerbosity = VERBOSITY_COMMAND_VERBOSE;
+    }
+    if (flags & GET_DEVICE_FUNCS_VERBOSE_BUFFERS)
+    {
+        winListVerbosity = VERBOSITY_BUFFERS;
+    }
 
-    //TODO: Check if sizeInBytes is a multiple of
     if (!(ptrToDeviceList) || (!sizeInBytes))
     {
         returnValue = BAD_PARAMETER;
@@ -4498,14 +4997,14 @@ int get_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versi
             fd = CreateFile(deviceName,
                 GENERIC_WRITE | GENERIC_READ, //FILE_ALL_ACCESS,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                NULL,
+                M_NULLPTR,
                 OPEN_EXISTING,
 #if !defined(WINDOWS_DISABLE_OVERLAPPED)
                 FILE_FLAG_OVERLAPPED,
 #else
                 0,
 #endif
-                NULL);
+                M_NULLPTR);
             if (fd != INVALID_HANDLE_VALUE)
             {
                 CloseHandle(fd);
@@ -4515,7 +5014,7 @@ int get_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versi
                 d->deviceVerbosity = temp;
                 d->sanity.size = ver.size;
                 d->sanity.version = ver.version;
-                d->dFlags = C_CAST(eDiscoveryOptions, flags);
+                d->dFlags =  flags;
                 returnValue = get_Device(name, d);
                 if (returnValue != SUCCESS)
                 {
@@ -4523,7 +5022,7 @@ int get_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versi
                 }
                 else
                 {
-                    PSTORAGE_ADAPTER_DESCRIPTOR adapterData = NULL;
+                    PSTORAGE_ADAPTER_DESCRIPTOR adapterData = M_NULLPTR;
                     if (SUCCESS == win_Get_Adapter_Descriptor(d->os_info.fd, &adapterData))
                     {
                         if (adapterData->BusType == BusTypeRAID)
@@ -4531,13 +5030,21 @@ int get_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versi
                             //get the SCSI address for this device and save it to the RAID handle list so it can be scanned for additional types of RAID interfaces.
                             SCSI_ADDRESS scsiAddress;
                             memset(&scsiAddress, 0, sizeof(SCSI_ADDRESS));
+                            if (VERBOSITY_COMMAND_NAMES <= winListVerbosity)
+                            {
+                                printf("Detected RAID adapter for %s\n", name);
+                            }
                             if (SUCCESS == win_Get_SCSI_Address(d->os_info.fd, &scsiAddress))
                             {
-                                char raidHandle[15] = { 0 };
+                                DECLARE_ZERO_INIT_ARRAY(char, raidHandle, RAID_HANDLE_STRING_MAX_LEN);
                                 raidTypeHint raidHint;
                                 memset(&raidHint, 0, sizeof(raidTypeHint));
-                                raidHint.unknownRAID = true;//TODO: Find a better way to hint at what type of raid we thing this might be. Can look at T10 vendor ID, low-level PCI/PCIe identifiers, etc.
-                                snprintf(raidHandle, 15, "\\\\.\\SCSI%" PRIu8 ":", scsiAddress.PortNumber);
+                                raidHint.unknownRAID = true;//TODO: Look up driver name to set hint instead of unknown to prevent excess IOCTLs being sent from retries.
+                                snprintf(raidHandle, RAID_HANDLE_STRING_MAX_LEN, "\\\\.\\SCSI%" PRIu8 ":", scsiAddress.PortNumber);
+                                if (VERBOSITY_COMMAND_NAMES <= winListVerbosity)
+                                {
+                                    printf("Adding %s to RAID handle list to scan for compatible devices\n", raidHandle);
+                                }
                                 raidHandleList = add_RAID_Handle_If_Not_In_List(beginRaidHandleList, raidHandleList, raidHandle, raidHint);
                                 if (!beginRaidHandleList)
                                 {
@@ -4546,7 +5053,7 @@ int get_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versi
                             }
                         }
                     }
-                    safe_Free(adapterData)
+                    safe_free_adapter_descriptor(&adapterData);
                 }
                 found++;
                 d++;
@@ -4571,20 +5078,24 @@ int get_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versi
                 }
             }
         }
-        
+
 #if defined (ENABLE_CSMI)
         if (!(flags & GET_DEVICE_FUNCS_IGNORE_CSMI))
         {
             uint32_t csmiDeviceCount = numberOfDevices - found;
             if (csmiDeviceCount > 0)
             {
-                int csmiRet = get_CSMI_RAID_Device_List(&ptrToDeviceList[found], csmiDeviceCount * sizeof(tDevice), ver, flags, &beginRaidHandleList);
+                eReturnValues csmiRet = get_CSMI_RAID_Device_List(&ptrToDeviceList[found], csmiDeviceCount * sizeof(tDevice), ver, flags, &beginRaidHandleList);
                 if (returnValue == SUCCESS && csmiRet != SUCCESS)
                 {
                     //this will override the normal ret if it is already set to success with the CSMI return value
                     returnValue = csmiRet;
                 }
             }
+        }
+        else if (VERBOSITY_COMMAND_NAMES <= winListVerbosity)
+        {
+            printf("CSMI Scan skipped due to flag\n");
         }
 #endif
         if (found == failedGetDeviceCount)
@@ -4601,6 +5112,10 @@ int get_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versi
         }
         //Clean up RAID handle list
         delete_RAID_List(beginRaidHandleList);
+    }
+    if (VERBOSITY_COMMAND_NAMES <= winListVerbosity)
+    {
+        printf("Win get device list returning %d\n", returnValue);
     }
 
     return returnValue;
@@ -4623,9 +5138,9 @@ typedef struct _scsiPassThroughEXIOStruct
 } scsiPassThroughEXIOStruct, *ptrSCSIPassThroughEXIOStruct;
 
 // \return SUCCESS - pass, !SUCCESS fail or something went wrong
-int convert_SCSI_CTX_To_SCSI_Pass_Through_EX(ScsiIoCtx *scsiIoCtx, ptrSCSIPassThroughEXIOStruct psptd)
+static eReturnValues convert_SCSI_CTX_To_SCSI_Pass_Through_EX(ScsiIoCtx *scsiIoCtx, ptrSCSIPassThroughEXIOStruct psptd)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     memset(&psptd->scsiPassThroughEX, 0, sizeof(SCSI_PASS_THROUGH_EX));
     psptd->scsiPassThroughEX.Version = 0;//MSDN says set this to zero
     psptd->scsiPassThroughEX.Length = sizeof(SCSI_PASS_THROUGH_EX);
@@ -4703,12 +5218,12 @@ int convert_SCSI_CTX_To_SCSI_Pass_Through_EX(ScsiIoCtx *scsiIoCtx, ptrSCSIPassTh
     return ret;
 }
 
-int send_SCSI_Pass_Through_EX(ScsiIoCtx *scsiIoCtx)
+static eReturnValues send_SCSI_Pass_Through_EX(ScsiIoCtx *scsiIoCtx)
 {
-    int           ret = FAILURE;
-    BOOL          success = FALSE;
-    ULONG         returned_data = 0;
-    ptrSCSIPassThroughEXIOStruct sptdioEx = C_CAST(ptrSCSIPassThroughEXIOStruct, malloc(sizeof(scsiPassThroughEXIOStruct)));
+    eReturnValues ret = FAILURE;
+    BOOL success = FALSE;
+    ULONG returned_data = 0;
+    ptrSCSIPassThroughEXIOStruct sptdioEx = C_CAST(ptrSCSIPassThroughEXIOStruct, safe_malloc(sizeof(scsiPassThroughEXIOStruct)));
     if (!sptdioEx)
     {
         return MEMORY_FAILURE;
@@ -4740,7 +5255,7 @@ int send_SCSI_Pass_Through_EX(ScsiIoCtx *scsiIoCtx)
         }
         OVERLAPPED overlappedStruct;
         memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-        overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
         start_Timer(&commandTimer);
         success = DeviceIoControl(scsiIoCtx->device->os_info.fd,
             IOCTL_SCSI_PASS_THROUGH_EX,
@@ -4762,7 +5277,7 @@ int send_SCSI_Pass_Through_EX(ScsiIoCtx *scsiIoCtx)
         }
         stop_Timer(&commandTimer);
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
         scsiIoCtx->returnStatus.senseKey = sptdioEx->scsiPassThroughEX.ScsiStatus;
 
         if (success)
@@ -4798,12 +5313,12 @@ int send_SCSI_Pass_Through_EX(ScsiIoCtx *scsiIoCtx)
         }
 
         // Any sense data?
-        if (scsiIoCtx->psense != NULL && scsiIoCtx->senseDataSize > 0)
+        if (scsiIoCtx->psense != M_NULLPTR && scsiIoCtx->senseDataSize > 0)
         {
             memcpy(scsiIoCtx->psense, &sptdioEx->senseBuffer[0], M_Min(sptdioEx->scsiPassThroughEX.SenseInfoLength, scsiIoCtx->senseDataSize));
         }
 
-        if (scsiIoCtx->psense != NULL)
+        if (scsiIoCtx->psense != M_NULLPTR)
         {
             //use the format, sensekey, acq, acsq from the sense data buffer we passed in rather than what windows reports...because windows doesn't always match what is in your sense buffer
             scsiIoCtx->returnStatus.format = scsiIoCtx->psense[0];
@@ -4825,14 +5340,14 @@ int send_SCSI_Pass_Through_EX(ScsiIoCtx *scsiIoCtx)
         }
     }
     scsiIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
-    safe_Free(sptdioEx)
+    safe_free(&sptdioEx);
     return ret;
 }
 
 // \return SUCCESS - pass, !SUCCESS fail or something went wrong
-int convert_SCSI_CTX_To_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx, ptrSCSIPassThroughEXIOStruct psptd, uint8_t *alignedPointer)
+static eReturnValues convert_SCSI_CTX_To_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx, ptrSCSIPassThroughEXIOStruct psptd, uint8_t *alignedPointer)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     memset(&psptd->scsiPassThroughEXDirect, 0, sizeof(SCSI_PASS_THROUGH_DIRECT_EX));
     psptd->scsiPassThroughEXDirect.Version = 0;//MSDN says set this to zero
     psptd->scsiPassThroughEXDirect.Length = sizeof(SCSI_PASS_THROUGH_DIRECT_EX);
@@ -4858,13 +5373,13 @@ int convert_SCSI_CTX_To_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx, ptrSCS
         psptd->scsiPassThroughEXDirect.DataDirection = SCSI_IOCTL_DATA_OUT;
         psptd->scsiPassThroughEXDirect.DataOutTransferLength = scsiIoCtx->dataLength;
         psptd->scsiPassThroughEXDirect.DataOutBuffer = alignedPointer;
-        psptd->scsiPassThroughEXDirect.DataInBuffer = NULL;
+        psptd->scsiPassThroughEXDirect.DataInBuffer = M_NULLPTR;
         break;
     case XFER_DATA_IN:
         psptd->scsiPassThroughEXDirect.DataDirection = SCSI_IOCTL_DATA_IN;
         psptd->scsiPassThroughEXDirect.DataInTransferLength = scsiIoCtx->dataLength;
         psptd->scsiPassThroughEXDirect.DataInBuffer = alignedPointer;
-        psptd->scsiPassThroughEXDirect.DataOutBuffer = NULL;
+        psptd->scsiPassThroughEXDirect.DataOutBuffer = M_NULLPTR;
         break;
     case XFER_NO_DATA:
         psptd->scsiPassThroughEXDirect.DataDirection = SCSI_IOCTL_DATA_UNSPECIFIED;
@@ -4910,13 +5425,13 @@ int convert_SCSI_CTX_To_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx, ptrSCS
     return ret;
 }
 
-int send_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx)
+static eReturnValues send_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx)
 {
-    int           ret = FAILURE;
-    BOOL          success = FALSE;
-    ULONG         returned_data = 0;
+    eReturnValues ret = FAILURE;
+    BOOL success = FALSE;
+    ULONG returned_data = 0;
     //size_t scsiPTIoStructSize = sizeof(scsiPassThroughEXIOStruct);
-    ptrSCSIPassThroughEXIOStruct sptdio = C_CAST(ptrSCSIPassThroughEXIOStruct, malloc(sizeof(scsiPassThroughEXIOStruct)));//add cdb and data length so that the memory allocated correctly!
+    ptrSCSIPassThroughEXIOStruct sptdio = C_CAST(ptrSCSIPassThroughEXIOStruct, safe_malloc(sizeof(scsiPassThroughEXIOStruct)));//add cdb and data length so that the memory allocated correctly!
     if (!sptdio)
     {
         return MEMORY_FAILURE;
@@ -4926,7 +5441,7 @@ int send_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx)
     memset(&commandTimer, 0, sizeof(seatimer_t));
     bool localAlignedBuffer = false;
     uint8_t *alignedPointer = scsiIoCtx->pdata;
-    uint8_t *localBuffer = NULL;//we need to save this to free up the memory properly later.
+    uint8_t *localBuffer = M_NULLPTR;//we need to save this to free up the memory properly later.
     //Check the alignment...if we need to use a local buffer, we'll use one, then copy the data back
     if (scsiIoCtx->pdata && scsiIoCtx->device->os_info.alignmentMask != 0)
     {
@@ -4937,7 +5452,7 @@ int send_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx)
         {
             localAlignedBuffer = true;
             uint32_t totalBufferSize = scsiIoCtx->dataLength + scsiIoCtx->device->os_info.alignmentMask;
-            localBuffer = C_CAST(uint8_t*, calloc(totalBufferSize, sizeof(uint8_t)));//TODO: If we want to remove allocating more memory, we should investigate making the scsiIoCtx->pdata a double pointer so we can reallocate it for the user.
+            localBuffer = C_CAST(uint8_t*, safe_calloc(totalBufferSize, sizeof(uint8_t)));
             if (!localBuffer)
             {
                 perror("error allocating aligned buffer for ATA Passthrough Direct...attempting to use user's pointer.");
@@ -4961,7 +5476,7 @@ int send_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx)
         DWORD sptBufLen = sizeof(scsiPassThroughEXIOStruct);
         OVERLAPPED overlappedStruct;
         memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-        overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
         start_Timer(&commandTimer);
         success = DeviceIoControl(scsiIoCtx->device->os_info.fd,
             IOCTL_SCSI_PASS_THROUGH_DIRECT_EX,
@@ -4983,7 +5498,7 @@ int send_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx)
         }
         stop_Timer(&commandTimer);
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
         scsiIoCtx->returnStatus.senseKey = sptdio->scsiPassThroughEXDirect.ScsiStatus;
 
         if (success)
@@ -5019,12 +5534,12 @@ int send_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx)
         }
 
         // Any sense data?
-        if (scsiIoCtx->psense != NULL && scsiIoCtx->senseDataSize > 0)
+        if (scsiIoCtx->psense != M_NULLPTR && scsiIoCtx->senseDataSize > 0)
         {
             memcpy(scsiIoCtx->psense, &sptdio->senseBuffer[0], M_Min(sptdio->scsiPassThroughEXDirect.SenseInfoLength, scsiIoCtx->senseDataSize));
         }
 
-        if (scsiIoCtx->psense != NULL)
+        if (scsiIoCtx->psense != M_NULLPTR)
         {
             //use the format, sensekey, acq, acsq from the sense data buffer we passed in rather than what windows reports...because windows doesn't always match what is in your sense buffer
             scsiIoCtx->returnStatus.format = scsiIoCtx->psense[0];
@@ -5045,9 +5560,9 @@ int send_SCSI_Pass_Through_EX_Direct(ScsiIoCtx *scsiIoCtx)
             }
         }
     }
-    safe_Free(sptdio)
+    safe_free(&sptdio);
     scsiIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
-    safe_Free(localBuffer)
+    safe_free(&localBuffer);
     return ret;
 }
 #endif //#if defined INCLUDED_SCSI_DOT_H
@@ -5064,10 +5579,15 @@ typedef struct _scsiPassThroughIOStruct {
     UCHAR                       dataBuffer[1];//for double buffered transfer only
 } scsiPassThroughIOStruct, *ptrSCSIPassThroughIOStruct;
 
-// \return SUCCESS - pass, !SUCCESS fail or something went wrong
-static int convert_SCSI_CTX_To_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx, ptrSCSIPassThroughIOStruct psptd, uint8_t *alignedPointer)
+static M_INLINE void safe_free_scsi_pt_io(scsiPassThroughIOStruct **scsipt)
 {
-    int ret = SUCCESS;
+    safe_Free(M_REINTERPRET_CAST(void**, scsipt));
+}
+
+// \return SUCCESS - pass, !SUCCESS fail or something went wrong
+static eReturnValues convert_SCSI_CTX_To_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx, ptrSCSIPassThroughIOStruct psptd, uint8_t *alignedPointer)
+{
+    eReturnValues ret = SUCCESS;
     psptd->scsiPassthroughDirect.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
     psptd->scsiPassthroughDirect.PathId = scsiIoCtx->device->os_info.scsi_addr.PathId;
     psptd->scsiPassthroughDirect.TargetId = scsiIoCtx->device->os_info.scsi_addr.TargetId;
@@ -5091,7 +5611,7 @@ static int convert_SCSI_CTX_To_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx, pt
     case XFER_NO_DATA:
         psptd->scsiPassthroughDirect.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED;
         psptd->scsiPassthroughDirect.DataTransferLength = 0;
-        psptd->scsiPassthroughDirect.DataBuffer = NULL;// psptd->SenseBuffer;
+        psptd->scsiPassthroughDirect.DataBuffer = M_NULLPTR;// psptd->SenseBuffer;
         break;
     default:
         if (VERBOSITY_QUIET < scsiIoCtx->device->deviceVerbosity)
@@ -5128,9 +5648,9 @@ static int convert_SCSI_CTX_To_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx, pt
     return ret;
 }
 
-static int convert_SCSI_CTX_To_SCSI_Pass_Through_Double_Buffered(ScsiIoCtx *scsiIoCtx, ptrSCSIPassThroughIOStruct psptd)
+static eReturnValues convert_SCSI_CTX_To_SCSI_Pass_Through_Double_Buffered(ScsiIoCtx *scsiIoCtx, ptrSCSIPassThroughIOStruct psptd)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     psptd->scsiPassthrough.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
     psptd->scsiPassthrough.PathId = scsiIoCtx->device->os_info.scsi_addr.PathId;
     psptd->scsiPassthrough.TargetId = scsiIoCtx->device->os_info.scsi_addr.TargetId;
@@ -5154,7 +5674,7 @@ static int convert_SCSI_CTX_To_SCSI_Pass_Through_Double_Buffered(ScsiIoCtx *scsi
     case XFER_NO_DATA:
         psptd->scsiPassthrough.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED;
         psptd->scsiPassthrough.DataTransferLength = 0;
-        psptd->scsiPassthrough.DataBufferOffset = offsetof(scsiPassThroughIOStruct, dataBuffer);//this may also be better off as NULL...IDK - TJE
+        psptd->scsiPassthrough.DataBufferOffset = offsetof(scsiPassThroughIOStruct, dataBuffer);//this may also be better off as M_NULLPTR...IDK - TJE
         break;
     default:
         if (VERBOSITY_QUIET < scsiIoCtx->device->deviceVerbosity)
@@ -5191,18 +5711,18 @@ static int convert_SCSI_CTX_To_SCSI_Pass_Through_Double_Buffered(ScsiIoCtx *scsi
     return ret;
 }
 
-static int send_SCSI_Pass_Through(ScsiIoCtx *scsiIoCtx)
+static eReturnValues send_SCSI_Pass_Through(ScsiIoCtx *scsiIoCtx)
 {
-    int           ret = FAILURE;
+    eReturnValues ret = FAILURE;
     BOOL          success = FALSE;
     ULONG         returned_data = 0;
-    ptrSCSIPassThroughIOStruct sptdioDB = C_CAST(ptrSCSIPassThroughIOStruct, malloc(sizeof(scsiPassThroughIOStruct) + scsiIoCtx->dataLength));
+    ptrSCSIPassThroughIOStruct sptdioDB = C_CAST(ptrSCSIPassThroughIOStruct, safe_malloc(sizeof(scsiPassThroughIOStruct) + scsiIoCtx->dataLength));
     if (!sptdioDB)
     {
         return MEMORY_FAILURE;
     }
     seatimer_t commandTimer;
-    memset(sptdioDB, 0, sizeof(scsiPassThroughIOStruct));
+    memset(sptdioDB, 0, sizeof(scsiPassThroughIOStruct) + scsiIoCtx->dataLength);
     memset(&commandTimer, 0, sizeof(seatimer_t));
     if (SUCCESS == convert_SCSI_CTX_To_SCSI_Pass_Through_Double_Buffered(scsiIoCtx, sptdioDB))
     {
@@ -5228,10 +5748,10 @@ static int send_SCSI_Pass_Through(ScsiIoCtx *scsiIoCtx)
         }
         OVERLAPPED overlappedStruct;
         memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-        overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        if (overlappedStruct.hEvent == NULL)
+        overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
+        if (overlappedStruct.hEvent == M_NULLPTR)
         {
-            safe_Free(sptdioDB)
+            safe_free_scsi_pt_io(&sptdioDB);
             return OS_PASSTHROUGH_FAILURE;
         }
         start_Timer(&commandTimer);
@@ -5255,7 +5775,7 @@ static int send_SCSI_Pass_Through(ScsiIoCtx *scsiIoCtx)
         }
         stop_Timer(&commandTimer);
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
         if (success)
         {
             // If the operation completes successfully, the return value is nonzero.
@@ -5290,12 +5810,12 @@ static int send_SCSI_Pass_Through(ScsiIoCtx *scsiIoCtx)
         scsiIoCtx->returnStatus.senseKey = sptdioDB->scsiPassthrough.ScsiStatus;
 
         // Any sense data?
-        if (scsiIoCtx->psense != NULL && scsiIoCtx->senseDataSize > 0)
+        if (scsiIoCtx->psense != M_NULLPTR && scsiIoCtx->senseDataSize > 0)
         {
             memcpy(scsiIoCtx->psense, sptdioDB->senseBuffer, M_Min(sptdioDB->scsiPassthrough.SenseInfoLength, scsiIoCtx->senseDataSize));
         }
 
-        if (scsiIoCtx->psense != NULL)
+        if (scsiIoCtx->psense != M_NULLPTR)
         {
             //use the format, sensekey, acq, acsq from the sense data buffer we passed in rather than what windows reports...because windows doesn't always match what is in your sense buffer
             scsiIoCtx->returnStatus.format = scsiIoCtx->psense[0];
@@ -5316,14 +5836,14 @@ static int send_SCSI_Pass_Through(ScsiIoCtx *scsiIoCtx)
             }
         }
     }
-    safe_Free(sptdioDB)
+    safe_free_scsi_pt_io(&sptdioDB);
     scsiIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
     return ret;
 }
 
-static int send_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx)
+static eReturnValues send_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx)
 {
-    int           ret = FAILURE;
+    eReturnValues ret = FAILURE;
     BOOL          success = FALSE;
     ULONG         returned_data = 0;
     scsiPassThroughIOStruct sptdio;
@@ -5332,7 +5852,7 @@ static int send_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx)
     memset(&commandTimer, 0, sizeof(seatimer_t));
     bool localAlignedBuffer = false;
     uint8_t *alignedPointer = scsiIoCtx->pdata;
-    uint8_t *localBuffer = NULL;//we need to save this to free up the memory properly later.
+    uint8_t *localBuffer = M_NULLPTR;//we need to save this to free up the memory properly later.
     //Check the alignment...if we need to use a local buffer, we'll use one, then copy the data back
     if (scsiIoCtx->pdata && scsiIoCtx->device->os_info.alignmentMask != 0)
     {
@@ -5343,7 +5863,7 @@ static int send_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx)
         {
             localAlignedBuffer = true;
             uint32_t totalBufferSize = scsiIoCtx->dataLength + C_CAST(uint32_t, scsiIoCtx->device->os_info.alignmentMask);
-            localBuffer = C_CAST(uint8_t*, calloc(totalBufferSize, sizeof(uint8_t)));//TODO: If we want to remove allocating more memory, we should investigate making the scsiIoCtx->pdata a double pointer so we can reallocate it for the user.
+            localBuffer = C_CAST(uint8_t*, safe_calloc(totalBufferSize, sizeof(uint8_t)));
             if (!localBuffer)
             {
                 perror("error allocating aligned buffer for ATA Passthrough Direct...attempting to use user's pointer.");
@@ -5367,7 +5887,7 @@ static int send_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx)
         DWORD scsiPassThroughBufLen = sizeof(scsiPassThroughIOStruct);
         OVERLAPPED overlappedStruct;
         memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-        overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
         start_Timer(&commandTimer);
         success = DeviceIoControl(scsiIoCtx->device->os_info.fd,
             IOCTL_SCSI_PASS_THROUGH_DIRECT,
@@ -5389,7 +5909,7 @@ static int send_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx)
         }
         stop_Timer(&commandTimer);
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
         if (success)
         {
             // If the operation completes successfully, the return value is nonzero.
@@ -5423,12 +5943,12 @@ static int send_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx)
         }
 
         // Any sense data?
-        if (scsiIoCtx->psense != NULL && scsiIoCtx->senseDataSize > 0)
+        if (scsiIoCtx->psense != M_NULLPTR && scsiIoCtx->senseDataSize > 0)
         {
             memcpy(scsiIoCtx->psense, sptdio.senseBuffer, M_Min(sptdio.scsiPassthroughDirect.SenseInfoLength, scsiIoCtx->senseDataSize));
         }
 
-        if (scsiIoCtx->psense != NULL)
+        if (scsiIoCtx->psense != M_NULLPTR)
         {
             //use the format, sensekey, acq, acsq from the sense data buffer we passed in rather than what windows reports...because windows doesn't always match what is in your sense buffer
             scsiIoCtx->returnStatus.format = scsiIoCtx->psense[0];
@@ -5450,11 +5970,11 @@ static int send_SCSI_Pass_Through_Direct(ScsiIoCtx *scsiIoCtx)
         }
     }
     scsiIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
-    safe_Free(localBuffer)
+    safe_free(&localBuffer);
     return ret;
 }
 
-static int send_SCSI_Pass_Through_IO( ScsiIoCtx *scsiIoCtx )
+static eReturnValues send_SCSI_Pass_Through_IO( ScsiIoCtx *scsiIoCtx )
 {
     if (scsiIoCtx->device->os_info.ioMethod == WIN_IOCTL_FORCE_ALWAYS_DIRECT)
     {
@@ -5516,9 +6036,9 @@ static int send_SCSI_Pass_Through_IO( ScsiIoCtx *scsiIoCtx )
 }
 
 // \return SUCCESS - pass, !SUCCESS fail or something went wrong
-static int convert_SCSI_CTX_To_ATA_PT_Direct(ScsiIoCtx *p_scsiIoCtx, PATA_PASS_THROUGH_DIRECT ptrATAPassThroughDirect, uint8_t *alignedDataPointer)
+static eReturnValues convert_SCSI_CTX_To_ATA_PT_Direct(ScsiIoCtx *p_scsiIoCtx, PATA_PASS_THROUGH_DIRECT ptrATAPassThroughDirect, uint8_t *alignedDataPointer)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
 
     ptrATAPassThroughDirect->Length = sizeof(ATA_PASS_THROUGH_DIRECT);
     ptrATAPassThroughDirect->AtaFlags = ATA_FLAGS_DRDY_REQUIRED;
@@ -5549,7 +6069,7 @@ static int convert_SCSI_CTX_To_ATA_PT_Direct(ScsiIoCtx *p_scsiIoCtx, PATA_PASS_T
         break;
     case XFER_NO_DATA:
         ptrATAPassThroughDirect->DataTransferLength = 0;
-        ptrATAPassThroughDirect->DataBuffer = NULL;
+        ptrATAPassThroughDirect->DataBuffer = M_NULLPTR;
         break;
     default:
         if (VERBOSITY_QUIET < p_scsiIoCtx->device->deviceVerbosity)
@@ -5631,9 +6151,9 @@ static int convert_SCSI_CTX_To_ATA_PT_Direct(ScsiIoCtx *p_scsiIoCtx, PATA_PASS_T
     return ret;
 }
 
-static int send_ATA_Passthrough_Direct(ScsiIoCtx *scsiIoCtx)
+static eReturnValues send_ATA_Passthrough_Direct(ScsiIoCtx *scsiIoCtx)
 {
-    int ret = FAILURE;
+    eReturnValues ret = FAILURE;
     BOOL success;
     ULONG returned_data = 0;
     ATA_PASS_THROUGH_DIRECT ataPassThroughDirect;
@@ -5642,7 +6162,7 @@ static int send_ATA_Passthrough_Direct(ScsiIoCtx *scsiIoCtx)
     memset(&ataPassThroughDirect, 0, sizeof(ATA_PASS_THROUGH_DIRECT));
     bool localAlignedBuffer = false;
     uint8_t *alignedPointer = scsiIoCtx->pdata;
-    uint8_t *localBuffer = NULL;//we need to save this to free up the memory properly later.
+    uint8_t *localBuffer = M_NULLPTR;//we need to save this to free up the memory properly later.
     //Check the alignment...if we need to use a local buffer, we'll use one, then copy the data back
     if (scsiIoCtx->pdata && scsiIoCtx->device->os_info.alignmentMask != 0)
     {
@@ -5653,7 +6173,7 @@ static int send_ATA_Passthrough_Direct(ScsiIoCtx *scsiIoCtx)
         {
             localAlignedBuffer = true;
             uint32_t totalBufferSize = scsiIoCtx->dataLength + C_CAST(uint32_t, scsiIoCtx->device->os_info.alignmentMask);
-            localBuffer = C_CAST(uint8_t*, calloc(totalBufferSize, sizeof(uint8_t)));//TODO: If we want to remove allocating more memory, we should investigate making the scsiIoCtx->pdata a double pointer so we can reallocate it for the user.
+            localBuffer = C_CAST(uint8_t*, safe_calloc(totalBufferSize, sizeof(uint8_t)));
             if (!localBuffer)
             {
                 perror("error allocating aligned buffer for ATA Passthrough Direct...attempting to use user's pointer.");
@@ -5678,7 +6198,7 @@ static int send_ATA_Passthrough_Direct(ScsiIoCtx *scsiIoCtx)
         SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
         OVERLAPPED overlappedStruct;
         memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-        overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
         start_Timer(&commandTimer);
         success = DeviceIoControl(scsiIoCtx->device->os_info.fd,
             IOCTL_ATA_PASS_THROUGH_DIRECT,
@@ -5720,7 +6240,7 @@ static int send_ATA_Passthrough_Direct(ScsiIoCtx *scsiIoCtx)
         if (overlappedStruct.hEvent)
         {
             CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-            overlappedStruct.hEvent = NULL;
+            overlappedStruct.hEvent = M_NULLPTR;
         }
         scsiIoCtx->returnStatus.format = SCSI_SENSE_CUR_INFO_DESC;
         if (success)
@@ -5751,7 +6271,7 @@ static int send_ATA_Passthrough_Direct(ScsiIoCtx *scsiIoCtx)
         scsiIoCtx->returnStatus.ascq = 0x1D;//might need to change this later
         //get the rtfrs and put them into a "sense buffer". In other words, fill in the sense buffer with the rtfrs in descriptor format
         //current = 28bit, previous = 48bit
-        if (scsiIoCtx->psense != NULL)//check that the pointer is valid
+        if (scsiIoCtx->psense != M_NULLPTR)//check that the pointer is valid
         {
             if (scsiIoCtx->senseDataSize >= 22)//check that the sense data buffer is big enough to fill in our rtfrs using descriptor format
             {
@@ -5800,7 +6320,7 @@ static int send_ATA_Passthrough_Direct(ScsiIoCtx *scsiIoCtx)
         scsiIoCtx->returnStatus.asc = 0x20;
         scsiIoCtx->returnStatus.ascq = 0x00;
         //dummy up sense data
-        if (scsiIoCtx->psense != NULL)
+        if (scsiIoCtx->psense != M_NULLPTR)
         {
             memset(scsiIoCtx->psense, 0, scsiIoCtx->senseDataSize);
             //fill in not supported
@@ -5820,7 +6340,7 @@ static int send_ATA_Passthrough_Direct(ScsiIoCtx *scsiIoCtx)
         }
     }
     scsiIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
-    safe_Free(localBuffer)//This will check if NULL before freeing it, so we shouldn't have any issues.
+    safe_free(&localBuffer);//This will check if M_NULLPTR before freeing it, so we shouldn't have any issues.
     return ret;
 }
 
@@ -5831,9 +6351,14 @@ typedef struct _ATADoubleBufferedIO
     UCHAR dataBuffer[1];
 }ATADoubleBufferedIO, *ptrATADoubleBufferedIO;
 
-static int convert_SCSI_CTX_To_ATA_PT_Ex(ScsiIoCtx *p_scsiIoCtx, ptrATADoubleBufferedIO p_t_ata_pt)
+static M_INLINE void safe_free_ata_db_io(ATADoubleBufferedIO **atadbio)
 {
-    int ret = SUCCESS;
+    safe_Free(M_REINTERPRET_CAST(void**, atadbio));
+}
+
+static eReturnValues convert_SCSI_CTX_To_ATA_PT_Ex(ScsiIoCtx *p_scsiIoCtx, ptrATADoubleBufferedIO p_t_ata_pt)
+{
+    eReturnValues ret = SUCCESS;
 
     p_t_ata_pt->ataPTCommand.Length = sizeof(ATA_PASS_THROUGH_EX);
     p_t_ata_pt->ataPTCommand.AtaFlags = ATA_FLAGS_DRDY_REQUIRED;
@@ -5864,7 +6389,7 @@ static int convert_SCSI_CTX_To_ATA_PT_Ex(ScsiIoCtx *p_scsiIoCtx, ptrATADoubleBuf
         break;
     case XFER_NO_DATA:
         p_t_ata_pt->ataPTCommand.DataTransferLength = 0;
-        p_t_ata_pt->ataPTCommand.DataBufferOffset = offsetof(ATADoubleBufferedIO, dataBuffer);//we always allocate at least 1 byte here...so give it something? Or do we set NULL? Seems to work as is... - TJE
+        p_t_ata_pt->ataPTCommand.DataBufferOffset = offsetof(ATADoubleBufferedIO, dataBuffer);//we always allocate at least 1 byte here...so give it something? Or do we set M_NULLPTR? Seems to work as is... - TJE
         break;
     default:
         if (VERBOSITY_QUIET < p_scsiIoCtx->device->deviceVerbosity)
@@ -5946,13 +6471,13 @@ static int convert_SCSI_CTX_To_ATA_PT_Ex(ScsiIoCtx *p_scsiIoCtx, ptrATADoubleBuf
     return ret;
 }
 
-static int send_ATA_Passthrough_Ex(ScsiIoCtx *scsiIoCtx)
+static eReturnValues send_ATA_Passthrough_Ex(ScsiIoCtx *scsiIoCtx)
 {
-    int ret = FAILURE;
+    eReturnValues ret = FAILURE;
     BOOL success;
     ULONG returned_data = 0;
     uint32_t dataLength = M_Max(scsiIoCtx->dataLength, scsiIoCtx->pAtaCmdOpts->dataSize);
-    ptrATADoubleBufferedIO doubleBufferedIO = C_CAST(ptrATADoubleBufferedIO, malloc(sizeof(ATA_PASS_THROUGH_EX) + dataLength));
+    ptrATADoubleBufferedIO doubleBufferedIO = C_CAST(ptrATADoubleBufferedIO, safe_malloc(sizeof(ATA_PASS_THROUGH_EX) + dataLength));
     if (!doubleBufferedIO)
     {
         //something went really wrong...
@@ -5986,7 +6511,7 @@ static int send_ATA_Passthrough_Ex(ScsiIoCtx *scsiIoCtx)
         SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
         OVERLAPPED overlappedStruct;
         memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-        overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
         start_Timer(&commandTimer);
         success = DeviceIoControl(scsiIoCtx->device->os_info.fd,
             IOCTL_ATA_PASS_THROUGH,
@@ -6018,7 +6543,7 @@ static int send_ATA_Passthrough_Ex(ScsiIoCtx *scsiIoCtx)
         if (overlappedStruct.hEvent)
         {
             CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-            overlappedStruct.hEvent = NULL;
+            overlappedStruct.hEvent = M_NULLPTR;
         }
         scsiIoCtx->returnStatus.format = SCSI_SENSE_CUR_INFO_DESC;
         if (success)
@@ -6058,7 +6583,7 @@ static int send_ATA_Passthrough_Ex(ScsiIoCtx *scsiIoCtx)
         scsiIoCtx->returnStatus.ascq = 0x1D;//might need to change this later
         //get the rtfrs and put them into a "sense buffer". In other words, fill in the sense buffer with the rtfrs in descriptor format
         //current = 28bit, previous = 48bit
-        if (scsiIoCtx->psense != NULL)//check that the pointer is valid
+        if (scsiIoCtx->psense != M_NULLPTR)//check that the pointer is valid
         {
             if (scsiIoCtx->senseDataSize >= 22)//check that the sense data buffer is big enough to fill in our rtfrs using descriptor format
             {
@@ -6107,7 +6632,7 @@ static int send_ATA_Passthrough_Ex(ScsiIoCtx *scsiIoCtx)
         scsiIoCtx->returnStatus.asc = 0x20;
         scsiIoCtx->returnStatus.ascq = 0x00;
         //dummy up sense data
-        if (scsiIoCtx->psense != NULL)
+        if (scsiIoCtx->psense != M_NULLPTR)
         {
             memset(scsiIoCtx->psense, 0, scsiIoCtx->senseDataSize);
             //fill in not supported
@@ -6127,12 +6652,12 @@ static int send_ATA_Passthrough_Ex(ScsiIoCtx *scsiIoCtx)
         }
     }
     scsiIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
-    safe_Free(doubleBufferedIO)
+    safe_free_ata_db_io(&doubleBufferedIO);
     return ret;
 }
 
 // \return SUCCESS - pass, !SUCCESS fail or something went wrong
-static int send_ATA_Pass_Through_IO( ScsiIoCtx *scsiIoCtx )
+static eReturnValues send_ATA_Pass_Through_IO( ScsiIoCtx *scsiIoCtx )
 {
     if (scsiIoCtx->device->os_info.ioMethod == WIN_IOCTL_FORCE_ALWAYS_DIRECT)
     {
@@ -6165,9 +6690,14 @@ typedef struct _IDEDoubleBufferedIO
     UCHAR   dataBuffer[1];
 }IDEDoubleBufferedIO, *ptrIDEDoubleBufferedIO;
 
-static int convert_SCSI_CTX_To_IDE_PT(ScsiIoCtx *p_scsiIoCtx, ptrIDEDoubleBufferedIO p_t_ide_pt)
+static M_INLINE void safe_free_ide_db_io(IDEDoubleBufferedIO **idedbio)
 {
-    int ret = SUCCESS;
+    safe_Free(M_REINTERPRET_CAST(void**, idedbio));
+}
+
+static eReturnValues convert_SCSI_CTX_To_IDE_PT(ScsiIoCtx *p_scsiIoCtx, ptrIDEDoubleBufferedIO p_t_ide_pt)
+{
+    eReturnValues ret = SUCCESS;
 
     if (p_scsiIoCtx->pAtaCmdOpts->commandType != ATA_CMD_TYPE_TASKFILE)
     {
@@ -6182,7 +6712,9 @@ static int convert_SCSI_CTX_To_IDE_PT(ScsiIoCtx *p_scsiIoCtx, ptrIDEDoubleBuffer
     case ATA_PROTOCOL_DMA:
     case ATA_PROTOCOL_UDMA:
     case ATA_PROTOCOL_PACKET_DMA:
-        //TODO: Some comments in old old legacy code say DMA is not supported with this IOCTL, so they don't issue the command...should we do this? - TJE
+        //Some comments in old old legacy code say DMA is not supported with this IOCTL, so they don't issue the command.
+        //We are allowing this through for now until we can debug it ourselves to see if it was an implementation issue
+        //or not using aligned memory, etc.
         break;
     case ATA_PROTOCOL_DEV_DIAG:
     case ATA_PROTOCOL_NO_DATA:
@@ -6215,9 +6747,9 @@ static int convert_SCSI_CTX_To_IDE_PT(ScsiIoCtx *p_scsiIoCtx, ptrIDEDoubleBuffer
     return ret;
 }
 //This code has not been tested! - TJE
-static int send_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
+static eReturnValues send_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
 {
-    int ret = FAILURE;
+    eReturnValues ret = FAILURE;
     if (scsiIoCtx->pAtaCmdOpts->commandType == ATA_CMD_TYPE_EXTENDED_TASKFILE)
     {
         return OS_COMMAND_NOT_AVAILABLE;//or NOT_SUPPORTED ? - TJE
@@ -6225,7 +6757,7 @@ static int send_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
     BOOL success;
     ULONG returned_data = 0;
     uint32_t dataLength = M_Max(scsiIoCtx->dataLength, scsiIoCtx->pAtaCmdOpts->dataSize);
-    ptrIDEDoubleBufferedIO doubleBufferedIO = C_CAST(ptrIDEDoubleBufferedIO, malloc(sizeof(IDEDoubleBufferedIO) - 1 + dataLength));
+    ptrIDEDoubleBufferedIO doubleBufferedIO = C_CAST(ptrIDEDoubleBufferedIO, safe_malloc(sizeof(IDEDoubleBufferedIO) - 1 + dataLength));
     if (!doubleBufferedIO)
     {
         //something went really wrong...
@@ -6259,7 +6791,7 @@ static int send_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
         SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
         OVERLAPPED overlappedStruct;
         memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-        overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
         start_Timer(&commandTimer);
         success = DeviceIoControl(scsiIoCtx->device->os_info.fd,
             IOCTL_IDE_PASS_THROUGH,
@@ -6296,7 +6828,7 @@ static int send_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
         if (overlappedStruct.hEvent)
         {
             CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-            overlappedStruct.hEvent = NULL;
+            overlappedStruct.hEvent = M_NULLPTR;
         }
         scsiIoCtx->returnStatus.format = SCSI_SENSE_CUR_INFO_DESC;
         if (success)
@@ -6328,7 +6860,7 @@ static int send_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
         scsiIoCtx->returnStatus.ascq = 0x1D;//might need to change this later
         //get the rtfrs and put them into a "sense buffer". In other words, fill in the sense buffer with the rtfrs in descriptor format
         //current = 28bit, previous = 48bit
-        if (scsiIoCtx->psense != NULL)//check that the pointer is valid
+        if (scsiIoCtx->psense != M_NULLPTR)//check that the pointer is valid
         {
             if (scsiIoCtx->senseDataSize >= 22)//check that the sense data buffer is big enough to fill in our rtfrs using descriptor format
             {
@@ -6368,7 +6900,7 @@ static int send_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
         scsiIoCtx->returnStatus.asc = 0x20;
         scsiIoCtx->returnStatus.ascq = 0x00;
         //dummy up sense data
-        if (scsiIoCtx->psense != NULL)
+        if (scsiIoCtx->psense != M_NULLPTR)
         {
             memset(scsiIoCtx->psense, 0, scsiIoCtx->senseDataSize);
             //fill in not supported
@@ -6388,62 +6920,61 @@ static int send_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
         }
     }
     scsiIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
-    safe_Free(doubleBufferedIO)
+    safe_free_ide_db_io(&doubleBufferedIO);
     return ret;
 }
 
 //This is untested code, but may work if an old system needed it.
 //https://community.osr.com/discussion/64468/scsiop-ata-passthrough-0xcc
-#define UNDOCUMENTED_SCSI_IDE_PT_OP_CODE 0xCC
-static int send_SCSI_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
-{
-    int ret = FAILURE;
-    ScsiIoCtx ideCtx;
-    memset(&ideCtx, 0, sizeof(ScsiIoCtx));
-    if (scsiIoCtx->pAtaCmdOpts->commandType == ATA_CMD_TYPE_EXTENDED_TASKFILE)
-    {
-        return OS_COMMAND_NOT_AVAILABLE;
-    }
-    
-    ideCtx.cdb[0] = UNDOCUMENTED_SCSI_IDE_PT_OP_CODE;
-    ideCtx.cdb[1] = RESERVED;
-    ideCtx.cdb[2] = scsiIoCtx->pAtaCmdOpts->tfr.ErrorFeature; // Features Register
-    ideCtx.cdb[3] = scsiIoCtx->pAtaCmdOpts->tfr.SectorCount; // Sector Count Reg
-    ideCtx.cdb[4] = scsiIoCtx->pAtaCmdOpts->tfr.LbaLow; // Sector Number ( or LBA Lo )
-    ideCtx.cdb[5] = scsiIoCtx->pAtaCmdOpts->tfr.LbaMid; // Cylinder Low ( or LBA Mid )
-    ideCtx.cdb[6] = scsiIoCtx->pAtaCmdOpts->tfr.LbaHi; // Cylinder High (or LBA Hi)
-    ideCtx.cdb[7] = scsiIoCtx->pAtaCmdOpts->tfr.DeviceHead; // Device/Head Register
-    ideCtx.cdb[8] = scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus; // Command Register
-    ideCtx.cdb[9] = 0;//control register
-
-    ideCtx.cdbLength = 10;
-    ideCtx.dataLength = scsiIoCtx->dataLength;
-    ideCtx.device = scsiIoCtx->device;
-    ideCtx.direction = scsiIoCtx->direction;
-    ideCtx.pdata = scsiIoCtx->pdata;
-    ideCtx.psense = scsiIoCtx->psense;
-    ideCtx.senseDataSize = scsiIoCtx->senseDataSize;
-    ideCtx.timeout = scsiIoCtx->timeout;
-
-    ret = send_SCSI_Pass_Through(&ideCtx);
-
-    //TODO: Turn sense data into RTFRs
-
-    return ret;
-}
+//#define UNDOCUMENTED_SCSI_IDE_PT_OP_CODE 0xCC
+//static eReturnValues send_SCSI_IDE_Pass_Through_IO(ScsiIoCtx *scsiIoCtx)
+//{
+//    eReturnValues ret = FAILURE;
+//    ScsiIoCtx ideCtx;
+//    memset(&ideCtx, 0, sizeof(ScsiIoCtx));
+//    if (scsiIoCtx->pAtaCmdOpts->commandType == ATA_CMD_TYPE_EXTENDED_TASKFILE)
+//    {
+//        return OS_COMMAND_NOT_AVAILABLE;
+//    }
+//    
+//    ideCtx.cdb[0] = UNDOCUMENTED_SCSI_IDE_PT_OP_CODE;
+//    ideCtx.cdb[1] = RESERVED;
+//    ideCtx.cdb[2] = scsiIoCtx->pAtaCmdOpts->tfr.ErrorFeature; // Features Register
+//    ideCtx.cdb[3] = scsiIoCtx->pAtaCmdOpts->tfr.SectorCount; // Sector Count Reg
+//    ideCtx.cdb[4] = scsiIoCtx->pAtaCmdOpts->tfr.LbaLow; // Sector Number ( or LBA Lo )
+//    ideCtx.cdb[5] = scsiIoCtx->pAtaCmdOpts->tfr.LbaMid; // Cylinder Low ( or LBA Mid )
+//    ideCtx.cdb[6] = scsiIoCtx->pAtaCmdOpts->tfr.LbaHi; // Cylinder High (or LBA Hi)
+//    ideCtx.cdb[7] = scsiIoCtx->pAtaCmdOpts->tfr.DeviceHead; // Device/Head Register
+//    ideCtx.cdb[8] = scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus; // Command Register
+//    ideCtx.cdb[9] = 0;//control register
+//
+//    ideCtx.cdbLength = 10;
+//    ideCtx.dataLength = scsiIoCtx->dataLength;
+//    ideCtx.device = scsiIoCtx->device;
+//    ideCtx.direction = scsiIoCtx->direction;
+//    ideCtx.pdata = scsiIoCtx->pdata;
+//    ideCtx.psense = scsiIoCtx->psense;
+//    ideCtx.senseDataSize = scsiIoCtx->senseDataSize;
+//    ideCtx.timeout = scsiIoCtx->timeout;
+//
+//    ret = send_SCSI_Pass_Through(&ideCtx);
+//
+//    //TODO: Turn sense data into RTFRs
+//
+//    return ret;
+//}
 
 #if WINVER >= SEA_WIN32_WINNT_WIN10
-//TODO: handle more than 1 firmware slot per device.-TJE
-int get_Windows_FWDL_IO_Support(tDevice *device, STORAGE_BUS_TYPE busType)
+eReturnValues get_Windows_FWDL_IO_Support(tDevice *device, STORAGE_BUS_TYPE busType)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
     STORAGE_HW_FIRMWARE_INFO_QUERY fwdlInfo;
     memset(&fwdlInfo, 0, sizeof(STORAGE_HW_FIRMWARE_INFO_QUERY));
     fwdlInfo.Version = sizeof(STORAGE_HW_FIRMWARE_INFO_QUERY);
     fwdlInfo.Size = sizeof(STORAGE_HW_FIRMWARE_INFO_QUERY);
     uint8_t slotCount = 7;//7 is maximum number of firmware slots...always reading with this for now since it doesn't hurt sas/sata drives. - TJE
     uint32_t outputDataSize = sizeof(STORAGE_HW_FIRMWARE_INFO) + (sizeof(STORAGE_HW_FIRMWARE_SLOT_INFO) * slotCount);
-    uint8_t *outputData = C_CAST(uint8_t*, malloc(outputDataSize));
+    uint8_t *outputData = C_CAST(uint8_t*, safe_malloc(outputDataSize));
     if (!outputData)
     {
         return MEMORY_FAILURE;
@@ -6462,7 +6993,7 @@ int get_Windows_FWDL_IO_Support(tDevice *device, STORAGE_BUS_TYPE busType)
         outputData,
         outputDataSize,
         &returned_data,
-        NULL);
+        M_NULLPTR);
     //Got the version info, but that doesn't mean we'll be successful with commands...
     if (fwdlRet)
     {
@@ -6471,7 +7002,6 @@ int get_Windows_FWDL_IO_Support(tDevice *device, STORAGE_BUS_TYPE busType)
         device->os_info.fwdlIOsupport.payloadAlignment = fwdlSupportedInfo->ImagePayloadAlignment;
         device->os_info.fwdlIOsupport.maxXferSize = fwdlSupportedInfo->ImagePayloadMaxSize;
 
-        //TODO: store more FWDL information as we need it
 #if defined (_DEBUG)
         printf("Got Win10 FWDL Info\n");
         printf("\tSupported: %d\n", fwdlSupportedInfo->SupportUpgrade);
@@ -6496,13 +7026,13 @@ int get_Windows_FWDL_IO_Support(tDevice *device, STORAGE_BUS_TYPE busType)
         //DWORD lastError = GetLastError();
         ret = FAILURE;
     }
-    safe_Free(outputData)
+    safe_free(&outputData);
     return ret;
 }
 
-static int win10_FW_Activate_IO_SCSI(ScsiIoCtx *scsiIoCtx)
+static eReturnValues win10_FW_Activate_IO_SCSI(ScsiIoCtx *scsiIoCtx)
 {
-    int ret = OS_PASSTHROUGH_FAILURE;
+    eReturnValues ret = OS_PASSTHROUGH_FAILURE;
     if (!scsiIoCtx)
     {
         return BAD_PARAMETER;
@@ -6532,13 +7062,13 @@ static int win10_FW_Activate_IO_SCSI(ScsiIoCtx *scsiIoCtx)
     memset(&commandTimer, 0, sizeof(seatimer_t));
     OVERLAPPED overlappedStruct;
     memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-    overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
     start_Timer(&commandTimer);
     int fwdlIO = DeviceIoControl(scsiIoCtx->device->os_info.fd,
         IOCTL_STORAGE_FIRMWARE_ACTIVATE,
         &downloadActivate,
         sizeof(STORAGE_HW_FIRMWARE_ACTIVATE),
-        NULL,
+        M_NULLPTR,
         0,
         &returned_data,
         &overlappedStruct
@@ -6557,7 +7087,7 @@ static int win10_FW_Activate_IO_SCSI(ScsiIoCtx *scsiIoCtx)
     if (overlappedStruct.hEvent)
     {
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
     }
     //dummy up sense data for end result
     if (fwdlIO)
@@ -6680,9 +7210,9 @@ static int win10_FW_Activate_IO_SCSI(ScsiIoCtx *scsiIoCtx)
 #if !defined (STORAGE_HW_FIRMWARE_REQUEST_FLAG_FIRST_SEGMENT)
 #define STORAGE_HW_FIRMWARE_REQUEST_FLAG_FIRST_SEGMENT 0x00000004
 #endif
-static int win10_FW_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
+static eReturnValues win10_FW_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
 {
-    int ret = OS_PASSTHROUGH_FAILURE;
+    eReturnValues ret = OS_PASSTHROUGH_FAILURE;
     uint32_t dataLength = 0;
     if (scsiIoCtx->device->deviceVerbosity >= VERBOSITY_COMMAND_VERBOSE)
     {
@@ -6698,7 +7228,7 @@ static int win10_FW_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
     }
     //send download IOCTL
     DWORD downloadStructureSize = sizeof(STORAGE_HW_FIRMWARE_DOWNLOAD) + dataLength;
-    PSTORAGE_HW_FIRMWARE_DOWNLOAD downloadIO = C_CAST(PSTORAGE_HW_FIRMWARE_DOWNLOAD, malloc(downloadStructureSize));
+    PSTORAGE_HW_FIRMWARE_DOWNLOAD downloadIO = C_CAST(PSTORAGE_HW_FIRMWARE_DOWNLOAD, safe_malloc(downloadStructureSize));
     if (!downloadIO)
     {
         return MEMORY_FAILURE;
@@ -6730,7 +7260,7 @@ static int win10_FW_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
         downloadIO->Slot = scsiIoCtx->cdb[2];//Set the slot number to the buffer ID number...This is the closest this translates.
     }
     //we need to set the offset since MS uses this in the command sent to the device.
-    downloadIO->Offset = 0;//TODO: Make sure this works even though the buffer pointer is only the current segment!
+    downloadIO->Offset = 0;
     if (scsiIoCtx && scsiIoCtx->pAtaCmdOpts)
     {
         //get offset from the tfrs
@@ -6743,7 +7273,7 @@ static int win10_FW_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
     }
     else
     {
-        safe_Free(downloadIO)
+        safe_free(&downloadIO);
         return BAD_PARAMETER;
     }
     //set the size of the buffer
@@ -6757,13 +7287,13 @@ static int win10_FW_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
     memset(&commandTimer, 0, sizeof(seatimer_t));
     OVERLAPPED overlappedStruct;
     memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-    overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
     start_Timer(&commandTimer);
     int fwdlIO = DeviceIoControl(scsiIoCtx->device->os_info.fd,
         IOCTL_STORAGE_FIRMWARE_DOWNLOAD,
         downloadIO,
         downloadStructureSize,
-        NULL,
+        M_NULLPTR,
         0,
         &returned_data,
         &overlappedStruct
@@ -6782,7 +7312,7 @@ static int win10_FW_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
     if (overlappedStruct.hEvent)
     {
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
     }
     //dummy up sense data for end result
     if (fwdlIO)
@@ -6907,7 +7437,7 @@ static int win10_FW_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
 }
 
 //call check function above to make sure this api call will actually work...
-static int windows_Firmware_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
+static eReturnValues windows_Firmware_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
 {
     if (!scsiIoCtx)
     {
@@ -6925,19 +7455,19 @@ static int windows_Firmware_Download_IO_SCSI(ScsiIoCtx *scsiIoCtx)
 #endif
 
 //Checks if SMART IO is supported and sets some bit flags up for later when issuing those IOs
-int get_Windows_SMART_IO_Support(tDevice *device)
+eReturnValues get_Windows_SMART_IO_Support(tDevice *device)
 {
     ULONG returned_data = 0;
     GETVERSIONINPARAMS smartVersionInfo;
     memset(&smartVersionInfo, 0, sizeof(GETVERSIONINPARAMS));
     int smartRet = DeviceIoControl(device->os_info.fd,
         SMART_GET_VERSION,
-        NULL,
+        M_NULLPTR,
         0,
         &smartVersionInfo,
         sizeof(GETVERSIONINPARAMS),
         &returned_data,
-        NULL);
+        M_NULLPTR);
     //Got the version info, but that doesn't mean we'll be successful with commands...
     if (smartRet)
     {
@@ -7014,7 +7544,7 @@ static DWORD io_For_SMART_Cmd(ScsiIoCtx *scsiIoCtx)
         {
             return INVALID_IOCTL;
         }
-    case ATA_SMART:
+    case ATA_SMART_CMD:
         if (scsiIoCtx->device->os_info.winSMARTCmdSupport.smartSupported)
         {
             //check that the feature field matches something Microsoft documents support for...using MS defines - TJE
@@ -7071,7 +7601,7 @@ static bool is_ATA_Cmd_Supported_By_SMART_IO(ScsiIoCtx *scsiIoCtx)
     }
 }
 
-static int convert_SCSI_CTX_To_ATA_SMART_Cmd(ScsiIoCtx *scsiIoCtx, PSENDCMDINPARAMS smartCmd)
+static eReturnValues convert_SCSI_CTX_To_ATA_SMART_Cmd(ScsiIoCtx *scsiIoCtx, PSENDCMDINPARAMS smartCmd)
 {
     if (!is_ATA_Cmd_Supported_By_SMART_IO(scsiIoCtx))
     {
@@ -7130,9 +7660,19 @@ static int convert_SCSI_CTX_To_ATA_SMART_Cmd(ScsiIoCtx *scsiIoCtx, PSENDCMDINPAR
     return SUCCESS;
 }
 
-static int send_ATA_SMART_Cmd_IO(ScsiIoCtx *scsiIoCtx)
+static M_INLINE void safe_free_smart_send_cmd_in(SENDCMDINPARAMS **cmd)
 {
-    int ret = FAILURE;
+    safe_Free(M_REINTERPRET_CAST(void**, cmd));
+}
+
+static M_INLINE void safe_free_smart_send_cmd_out(SENDCMDOUTPARAMS **cmd)
+{
+    safe_Free(M_REINTERPRET_CAST(void**, cmd));
+}
+
+static eReturnValues send_ATA_SMART_Cmd_IO(ScsiIoCtx *scsiIoCtx)
+{
+    eReturnValues ret = FAILURE;
     if (scsiIoCtx->pAtaCmdOpts->commandType == ATA_CMD_TYPE_EXTENDED_TASKFILE)
     {
         return OS_COMMAND_NOT_AVAILABLE;
@@ -7158,17 +7698,17 @@ static int send_ATA_SMART_Cmd_IO(ScsiIoCtx *scsiIoCtx)
     default:
         break;
     }
-    PSENDCMDINPARAMS smartIOin = C_CAST(PSENDCMDINPARAMS, calloc(1, sizeof(SENDCMDINPARAMS) - 1 + dataInLength));
+    PSENDCMDINPARAMS smartIOin = C_CAST(PSENDCMDINPARAMS, safe_calloc(1, sizeof(SENDCMDINPARAMS) - 1 + dataInLength));
     if (!smartIOin)
     {
         //something went really wrong...
         return MEMORY_FAILURE;
     }
-    PSENDCMDOUTPARAMS smartIOout = C_CAST(PSENDCMDOUTPARAMS, calloc(1, sizeof(SENDCMDOUTPARAMS) - 1 + dataOutLength + magicPadding));
+    PSENDCMDOUTPARAMS smartIOout = C_CAST(PSENDCMDOUTPARAMS, safe_calloc(1, sizeof(SENDCMDOUTPARAMS) - 1 + dataOutLength + magicPadding));
     if (!smartIOout)
     {
-        safe_Free(smartIOin)
-        //something went really wrong...
+        safe_free_smart_send_cmd_in(&smartIOin);
+        //something went really wrong
         return MEMORY_FAILURE;
     }
     seatimer_t commandTimer;
@@ -7201,7 +7741,7 @@ static int send_ATA_SMART_Cmd_IO(ScsiIoCtx *scsiIoCtx)
         SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
         OVERLAPPED overlappedStruct;
         memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-        overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
         start_Timer(&commandTimer);
         success = DeviceIoControl(scsiIoCtx->device->os_info.fd,
             io_For_SMART_Cmd(scsiIoCtx),//This function gets the correct IOCTL for us
@@ -7231,7 +7771,7 @@ static int send_ATA_SMART_Cmd_IO(ScsiIoCtx *scsiIoCtx)
         }
         stop_Timer(&commandTimer);
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
         scsiIoCtx->returnStatus.format = SCSI_SENSE_CUR_INFO_DESC;
         if (success)
         {
@@ -7267,7 +7807,7 @@ static int send_ATA_SMART_Cmd_IO(ScsiIoCtx *scsiIoCtx)
         scsiIoCtx->returnStatus.ascq = 0x1D;//might need to change this later
         //get the rtfrs and put them into a "sense buffer". In other words, fill in the sense buffer with the rtfrs in descriptor format
         //current = 28bit, previous = 48bit
-        if (scsiIoCtx->psense != NULL)//check that the pointer is valid
+        if (scsiIoCtx->psense != M_NULLPTR)//check that the pointer is valid
         {
             if (scsiIoCtx->senseDataSize >= 22)//check that the sense data buffer is big enough to fill in our rtfrs using descriptor format
             {
@@ -7291,7 +7831,6 @@ static int send_ATA_SMART_Cmd_IO(ScsiIoCtx *scsiIoCtx)
                 scsiIoCtx->psense[8] = 0x09;//descriptor code
                 scsiIoCtx->psense[9] = 0x0C;//additional descriptor length
                 scsiIoCtx->psense[10] = 0;
-                //TODO: should this be checked somewhere above? or is here good?
                 switch (smartIOout->DriverStatus.bDriverError)
                 {
                 case SMART_NO_ERROR://command issued without error
@@ -7342,7 +7881,7 @@ static int send_ATA_SMART_Cmd_IO(ScsiIoCtx *scsiIoCtx)
         scsiIoCtx->returnStatus.asc = 0x20;
         scsiIoCtx->returnStatus.ascq = 0x00;
         //dummy up sense data
-        if (scsiIoCtx->psense != NULL)
+        if (scsiIoCtx->psense != M_NULLPTR)
         {
             memset(scsiIoCtx->psense, 0, scsiIoCtx->senseDataSize);
             //fill in not supported
@@ -7362,14 +7901,14 @@ static int send_ATA_SMART_Cmd_IO(ScsiIoCtx *scsiIoCtx)
         }
     }
     scsiIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
-    safe_Free(smartIOin)
-    safe_Free(smartIOout)
+    safe_free_smart_send_cmd_in(&smartIOin);
+    safe_free_smart_send_cmd_out(&smartIOout);
     return ret;
 }
 
-int os_Device_Reset(tDevice *device)
+eReturnValues os_Device_Reset(tDevice *device)
 {
-    int ret = FAILURE;
+    eReturnValues ret = FAILURE;
     //this IOCTL is only supported for non-scsi devices, which includes anything (ata or scsi) attached to a USB or SCSI or SAS interface
     //This does not seem to work since it is obsolete and likely not implemented in modern drivers
     //use the Windows API call - http://msdn.microsoft.com/en-us/library/windows/hardware/ff560603%28v=vs.85%29.aspx
@@ -7379,11 +7918,11 @@ int os_Device_Reset(tDevice *device)
     device->os_info.last_error = NO_ERROR;
     success = DeviceIoControl(device->os_info.fd,
         OBSOLETE_IOCTL_STORAGE_RESET_DEVICE,
-        NULL,
+        M_NULLPTR,
         0,
-        NULL,
+        M_NULLPTR,
         0,
-        NULL,
+        M_NULLPTR,
         FALSE);
     device->os_info.last_error = GetLastError();
     if (success && device->os_info.last_error == NO_ERROR)
@@ -7394,18 +7933,18 @@ int os_Device_Reset(tDevice *device)
     {
         ret = OS_COMMAND_NOT_AVAILABLE;
     }
-    //TODO: catch not supported versus an error
     return ret;
 }
 
-int os_Bus_Reset(tDevice *device)
+eReturnValues os_Bus_Reset(tDevice *device)
 {
-    int ret = FAILURE;
+    eReturnValues ret = FAILURE;
     //This does not seem to work since it is obsolete and likely not implemented in modern drivers
     //use the Windows API call - http://msdn.microsoft.com/en-us/library/windows/hardware/ff560600%28v=vs.85%29.aspx
     ULONG returned_data = 0;
     BOOL success = 0;
-    STORAGE_BUS_RESET_REQUEST reset = { 0 };
+    STORAGE_BUS_RESET_REQUEST reset;
+    memset(&reset, 0, sizeof(STORAGE_BUS_RESET_REQUEST));
     reset.PathId = device->os_info.scsi_addr.PathId;
     SetLastError(NO_ERROR);
     device->os_info.last_error = NO_ERROR;
@@ -7426,22 +7965,21 @@ int os_Bus_Reset(tDevice *device)
     {
         ret = OS_COMMAND_NOT_AVAILABLE;
     }
-    //TODO: catch not supported versus an error
     return ret;
 }
 
-int os_Controller_Reset(M_ATTR_UNUSED tDevice *device)
+eReturnValues os_Controller_Reset(M_ATTR_UNUSED tDevice *device)
 {
     return OS_COMMAND_NOT_AVAILABLE;
 }
 
 //TODO: We may need to switch between locking fd and scsiSrbHandle in some way...for now just locking fd value.
 //https://docs.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_lock_volume
-int os_Lock_Device(tDevice *device)
+eReturnValues os_Lock_Device(tDevice *device)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     DWORD returnedBytes = 0;
-    if (!DeviceIoControl(device->os_info.fd, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &returnedBytes, NULL))
+    if (!DeviceIoControl(device->os_info.fd, FSCTL_LOCK_VOLUME, M_NULLPTR, 0, M_NULLPTR, 0, &returnedBytes, M_NULLPTR))
     {
         //This can fail is files are open, it's a system disk, or has a pagefile.
         ret = FAILURE;
@@ -7449,31 +7987,119 @@ int os_Lock_Device(tDevice *device)
     return ret;
 }
 
-int os_Unlock_Device(tDevice *device)
+eReturnValues os_Unlock_Device(tDevice *device)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     DWORD returnedBytes = 0;
-    if (!DeviceIoControl(device->os_info.fd, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, &returnedBytes, NULL))
+    if (!DeviceIoControl(device->os_info.fd, FSCTL_UNLOCK_VOLUME, M_NULLPTR, 0, M_NULLPTR, 0, &returnedBytes, M_NULLPTR))
     {
         ret = FAILURE;
     }
     return ret;
 }
 
-//This basic translation is for odd or old devices that aren't supporting passthrough.
-//It is set to be more basic, while still fulfilling some required SCSI commands to make
-//sure that upper layer code is happy with what this is reporting.
-//This may be able to be expanded, but don't count on it too much.
-//Expansion could come in VPD pages, maybe mode pages (read only most likely). But that is more than needed for now.
-static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
+eReturnValues os_Unmount_File_Systems_On_Device(tDevice *device)
 {
-    int ret = SUCCESS;
-    bool setSenseData = false;
-    bool fua = false;//for read/write only
-    uint8_t senseKey = 0, asc = 0, ascq = 0;
-    switch (scsiIoCtx->cdb[OPERATION_CODE])
+    eReturnValues ret = SUCCESS;
+    //If the volume bitfield is blank, then there is nothing to unmount - TJE
+    if (device->os_info.volumeBitField > 0)
     {
-    case INQUIRY_CMD:
+        //go through each bit in the bitfield. Bit0 = A, BIT1 = B, BIT2 = C, etc
+        //unmount each volume for the specified device.
+        uint8_t volIter = 0;
+        TCHAR volumeLetter = 'A';//always start with A
+        for (volIter = 0; volIter < MAX_VOL_BITS; ++volIter, ++volumeLetter)
+        {
+            if (M_BitN(volIter) & device->os_info.volumeBitField)
+            {
+                //found a volume.
+                //Steps:
+                //1. open handle to the volume
+                //2. lock the volume: FSCTL_LOCK_VOLUME
+                //3. dismount volume: FSCTL_DISMOUNT_VOLUME 
+                //4. unlock the volume: FSCTL_UNLOCK_VOLUME
+                //5. close the handle to the volume
+                HANDLE volumeHandle = INVALID_HANDLE_VALUE;
+                DWORD bytesReturned = 0;
+                DECLARE_ZERO_INIT_ARRAY(TCHAR, volumeHandleString, MAX_VOL_STR_LEN);
+                _sntprintf_s(volumeHandleString, MAX_VOL_STR_LEN, _TRUNCATE, TEXT("\\\\.\\%c:"), volumeLetter);
+                volumeHandle = CreateFile(volumeHandleString, GENERIC_WRITE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, M_NULLPTR, OPEN_EXISTING, 0, M_NULLPTR);
+                if (INVALID_HANDLE_VALUE != volumeHandle)
+                {
+                    BOOL ioctlResult = FALSE;
+                    BOOL lockResult = FALSE;
+                    lockResult = DeviceIoControl(volumeHandle, FSCTL_LOCK_VOLUME, M_NULLPTR, 0, M_NULLPTR, 0, &bytesReturned, M_NULLPTR);
+                    if (lockResult == FALSE)
+                    {
+                        if (device->deviceVerbosity >= VERBOSITY_COMMAND_NAMES)
+                        {
+                            _tprintf(TEXT("WARNING: Unable to lock volume: %s\n"), volumeHandleString);
+                        }
+                    }
+                    ioctlResult = DeviceIoControl(volumeHandle, FSCTL_DISMOUNT_VOLUME, M_NULLPTR, 0, M_NULLPTR, 0, &bytesReturned, M_NULLPTR);
+                    if (ioctlResult == FALSE)
+                    {
+                        if (device->deviceVerbosity >= VERBOSITY_COMMAND_NAMES)
+                        {
+                            _tprintf(TEXT("Error: Unable to dismount volume: %s\n"), volumeHandleString);
+                        }
+                        ret = FAILURE;
+                    }
+                    if (lockResult == TRUE)
+                    {
+                        ioctlResult = DeviceIoControl(volumeHandle, FSCTL_UNLOCK_VOLUME, M_NULLPTR, 0, M_NULLPTR, 0, &bytesReturned, M_NULLPTR);
+                        if (ioctlResult == FALSE)
+                        {
+                            if (device->deviceVerbosity >= VERBOSITY_COMMAND_NAMES)
+                            {
+                                _tprintf(TEXT("WARNING: Unable to unlock volume: %s\n"), volumeHandleString);
+                            }
+                        }
+                    }
+                    CloseHandle(volumeHandle);
+                    volumeHandle = INVALID_HANDLE_VALUE;
+                }
+            }
+        }
+    }
+    return ret;
+}
+
+static void wbst_Set_Sense_Data(ScsiIoCtx* scsiIoCtx, bool valid, uint8_t senseKey, uint8_t asc, uint8_t ascq)
+{
+    if (scsiIoCtx->psense && scsiIoCtx->senseDataSize > 0)
+    {
+        DECLARE_ZERO_INIT_ARRAY(uint8_t, senseData, 18);
+        if (valid)
+        {
+            senseData[0] = 0x70;
+            //sense key
+            senseData[2] |= M_Nibble0(senseKey);
+            //additional sense length
+            senseData[7] = 10;
+            //asc
+            senseData[12] = asc;
+            //ascq
+            senseData[13] = ascq;
+            if (scsiIoCtx->senseDataSize < 14)
+            {
+                //sense data overflows the available buffer
+                senseData[2] |= BIT4;
+            }
+        }
+        memcpy(scsiIoCtx->psense, senseData, M_Min(18, scsiIoCtx->senseDataSize));
+    }
+}
+
+static eReturnValues wbst_Inquiry(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 6)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         //Check to make sure cmdDT and reserved bits aren't set
         if (scsiIoCtx->cdb[1] & 0xFE)
         {
@@ -7488,16 +8114,16 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
             //check EVPD bit
             if (scsiIoCtx->cdb[1] & BIT0)
             {
-                uint8_t vpdPage[96] = { 0 };//this should be more than big enough for the pages supported on this basic device - TJE
+                DECLARE_ZERO_INIT_ARRAY(uint8_t, vpdPage, 96);//this should be more than big enough for the pages supported on this basic device - TJE
                 uint8_t peripheralDevice = 0;
-                PSTORAGE_DEVICE_DESCRIPTOR deviceDesc = NULL;//needed for scsi device type on all VPD pages - TJE
+                PSTORAGE_DEVICE_DESCRIPTOR deviceDesc = M_NULLPTR;//needed for scsi device type on all VPD pages - TJE
                 vpdPage[0] = peripheralDevice;
                 if (SUCCESS == win_Get_Device_Descriptor(scsiIoCtx->device->os_info.fd, &deviceDesc))
                 {
                     uint8_t vpdPageLen = 0;
                     //set device type again from descriptor data
                     vpdPage[0] = deviceDesc->DeviceType;
-                    //TODO: check the VPD page to set up that data correctly
+                    //check the VPD page to set up that data correctly
                     //      the vpd pagecodes below are probably the only ones that could be implemented with the 
                     //      limited capabilities we have at this point
                     switch (scsiIoCtx->cdb[2])
@@ -7507,18 +8133,17 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                         vpdPageLen++;
                         vpdPage[4 + vpdPageLen] = UNIT_SERIAL_NUMBER;
                         vpdPageLen++;
-                        //TODO: add more pages here as they are supported
                         vpdPage[3] = vpdPageLen;
                         break;
                     case UNIT_SERIAL_NUMBER:
                         vpdPage[1] = UNIT_SERIAL_NUMBER;
                         if (deviceDesc->RawPropertiesLength > 0)
                         {
-                            char *devSerial = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->SerialNumberOffset);
+                            const char* devSerial = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->SerialNumberOffset);
                             if (deviceDesc->SerialNumberOffset && deviceDesc->SerialNumberOffset != UINT32_MAX)
                             {
-                                memcpy(&vpdPage[4], devSerial, M_Min(strlen(devSerial), 92));//92 for maximum size of current remaining memory for this page
-                                vpdPageLen = vpdPage[3] = C_CAST(uint8_t, M_Min(strlen(devSerial), 92));
+                                memcpy(&vpdPage[4], devSerial, M_Min(safe_strlen(devSerial), 92));//92 for maximum size of current remaining memory for this page
+                                vpdPageLen = vpdPage[3] = C_CAST(uint8_t, M_Min(safe_strlen(devSerial), 92));
                             }
                             else
                             {
@@ -7581,7 +8206,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                     {
                         memcpy(scsiIoCtx->pdata, vpdPage, M_Min(96U, M_Min(vpdPageLen + 4U, scsiIoCtx->dataLength)));
                     }
-                    safe_Free(deviceDesc)
+                    safe_free_device_descriptor(&deviceDesc);
                 }
                 else
                 {
@@ -7595,9 +8220,9 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
             else
             {
                 //standard inquiry data - use device descriptor data
-                uint8_t inquiryData[96] = { 0 };
+                DECLARE_ZERO_INIT_ARRAY(uint8_t, inquiryData, 96);
                 uint8_t peripheralDevice = 0;
-                PSTORAGE_DEVICE_DESCRIPTOR deviceDesc = NULL;
+                PSTORAGE_DEVICE_DESCRIPTOR deviceDesc = M_NULLPTR;
                 if (scsiIoCtx->cdb[2] == 0)
                 {
                     inquiryData[0] = peripheralDevice;
@@ -7610,21 +8235,20 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                     {
                         //set device type again from descriptor data
                         inquiryData[0] = deviceDesc->DeviceType;
-                        //TODO: Device type modifier
                         if (deviceDesc->RemovableMedia)
                         {
                             inquiryData[1] |= BIT7;
                         }
                         if (deviceDesc->RawPropertiesLength > 0)
                         {
-                            char *devVendor = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->VendorIdOffset);
-                            char *devModel = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->ProductIdOffset);
-                            char *devRev = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->ProductRevisionOffset);
-                            char *devSerial = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->SerialNumberOffset);
+                            char* devVendor = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->VendorIdOffset);
+                            char* devModel = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->ProductIdOffset);
+                            char* devRev = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->ProductRevisionOffset);
+                            char* devSerial = C_CAST(char*, deviceDesc->RawDeviceProperties + deviceDesc->SerialNumberOffset);
                             if (deviceDesc->VendorIdOffset && deviceDesc->VendorIdOffset != UINT32_MAX)
                             {
                                 memset(&inquiryData[8], ' ', 8);//space pad first as spec says ASCII data should be space padded
-                                memcpy(&inquiryData[8], devVendor, M_Min(strlen(devVendor), 8));//maximum of 8 characters in length
+                                memcpy(&inquiryData[8], devVendor, M_Min(safe_strlen(devVendor), 8));//maximum of 8 characters in length
                             }
                             else
                             {
@@ -7641,7 +8265,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                             if (deviceDesc->ProductIdOffset && deviceDesc->ProductIdOffset != UINT32_MAX)
                             {
                                 memset(&inquiryData[16], ' ', 16);//space pad first as spec says ASCII data should be space padded
-                                memcpy(&inquiryData[16], devModel, M_Min(strlen(devModel), 16));
+                                memcpy(&inquiryData[16], devModel, M_Min(safe_strlen(devModel), 16));
                             }
                             else
                             {
@@ -7665,7 +8289,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                             if (deviceDesc->ProductRevisionOffset && deviceDesc->ProductRevisionOffset != UINT32_MAX)
                             {
                                 memset(&inquiryData[32], ' ', 4);//space pad first as spec says ASCII data should be space padded
-                                memcpy(&inquiryData[32], devRev, M_Min(strlen(devRev), 4));
+                                memcpy(&inquiryData[32], devRev, M_Min(safe_strlen(devRev), 4));
                             }
                             else
                             {
@@ -7678,7 +8302,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                             //a fairly common practice overall. - TJE
                             if (deviceDesc->SerialNumberOffset && deviceDesc->SerialNumberOffset != UINT32_MAX)
                             {
-                                memcpy(&inquiryData[36], devSerial, M_Min(strlen(devSerial), 20));
+                                memcpy(&inquiryData[36], devSerial, M_Min(safe_strlen(devSerial), 20));
                             }
                         }
                         else
@@ -7714,7 +8338,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                             inquiryData[34] = 'K';
                             inquiryData[35] = 'E';
                         }
-                        safe_Free(deviceDesc)
+                        safe_free_device_descriptor(&deviceDesc);
                     }
                     else
                     {
@@ -7744,8 +8368,24 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
             }
         }
-        break;
-    case READ_CAPACITY_10:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Read_Capacity_10(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 10)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if (scsiIoCtx->cdb[1] != 0 || scsiIoCtx->cdb[2] != 0 || scsiIoCtx->cdb[3] != 0 || scsiIoCtx->cdb[4] != 0 || scsiIoCtx->cdb[5] != 0 || scsiIoCtx->cdb[6] != 0 || scsiIoCtx->cdb[7] != 0 || scsiIoCtx->cdb[8] != 0)
         {
             //invalid field in CDB
@@ -7757,11 +8397,11 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
         else
         {
             //device geometry IOCTLs for remaining data
-            uint8_t readCapacityData[8] = { 0 };
+            DECLARE_ZERO_INIT_ARRAY(uint8_t, readCapacityData, READ_CAPACITY_10_LEN);
 #if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN2K
-            PDISK_GEOMETRY_EX geometryEx = NULL;
-            PDISK_PARTITION_INFO partition = NULL;
-            PDISK_DETECTION_INFO detection = NULL;
+            PDISK_GEOMETRY_EX geometryEx = M_NULLPTR;
+            PDISK_PARTITION_INFO partition = M_NULLPTR;
+            PDISK_DETECTION_INFO detection = M_NULLPTR;
             if (SUCCESS == win_Get_Drive_Geometry_Ex(scsiIoCtx->device->os_info.fd, &geometryEx, &partition, &detection))
             {
                 if ((geometryEx->DiskSize.QuadPart / geometryEx->Geometry.BytesPerSector) > UINT32_MAX)
@@ -7774,21 +8414,21 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    readCapacityData[0] = M_Byte3(C_CAST(uint64_t, geometryEx->DiskSize.QuadPart) / C_CAST(uint64_t,geometryEx->Geometry.BytesPerSector));
-                    readCapacityData[1] = M_Byte2(C_CAST(uint64_t, geometryEx->DiskSize.QuadPart) / C_CAST(uint64_t,geometryEx->Geometry.BytesPerSector));
-                    readCapacityData[2] = M_Byte1(C_CAST(uint64_t, geometryEx->DiskSize.QuadPart) / C_CAST(uint64_t,geometryEx->Geometry.BytesPerSector));
-                    readCapacityData[3] = M_Byte0(C_CAST(uint64_t, geometryEx->DiskSize.QuadPart) / C_CAST(uint64_t,geometryEx->Geometry.BytesPerSector));
+                    readCapacityData[0] = M_Byte3(C_CAST(uint64_t, geometryEx->DiskSize.QuadPart) / C_CAST(uint64_t, geometryEx->Geometry.BytesPerSector));
+                    readCapacityData[1] = M_Byte2(C_CAST(uint64_t, geometryEx->DiskSize.QuadPart) / C_CAST(uint64_t, geometryEx->Geometry.BytesPerSector));
+                    readCapacityData[2] = M_Byte1(C_CAST(uint64_t, geometryEx->DiskSize.QuadPart) / C_CAST(uint64_t, geometryEx->Geometry.BytesPerSector));
+                    readCapacityData[3] = M_Byte0(C_CAST(uint64_t, geometryEx->DiskSize.QuadPart) / C_CAST(uint64_t, geometryEx->Geometry.BytesPerSector));
                 }
                 readCapacityData[4] = M_Byte3(geometryEx->Geometry.BytesPerSector);
                 readCapacityData[5] = M_Byte2(geometryEx->Geometry.BytesPerSector);
                 readCapacityData[6] = M_Byte1(geometryEx->Geometry.BytesPerSector);
                 readCapacityData[7] = M_Byte0(geometryEx->Geometry.BytesPerSector);
-                safe_Free(geometryEx)
+                safe_free_disk_geometry_ex(&geometryEx);
             }
             else
 #endif //WINVER >= SEA_WIN32_WINNT_WIN2K
             {
-                PDISK_GEOMETRY geometry = NULL;
+                PDISK_GEOMETRY geometry = M_NULLPTR;
                 if (SUCCESS == win_Get_Drive_Geometry(scsiIoCtx->device->os_info.fd, &geometry))
                 {
                     uint64_t maxLBA = C_CAST(uint64_t, geometry->Cylinders.QuadPart) * geometry->TracksPerCylinder * geometry->SectorsPerTrack;
@@ -7811,7 +8451,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                     readCapacityData[5] = M_Byte2(geometry->BytesPerSector);
                     readCapacityData[6] = M_Byte1(geometry->BytesPerSector);
                     readCapacityData[7] = M_Byte0(geometry->BytesPerSector);
-                    safe_Free(geometry)
+                    safe_free_disk_geometry(&geometry);
                 }
                 else
                 {
@@ -7824,11 +8464,27 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
             }
             if (scsiIoCtx->pdata && scsiIoCtx->dataLength > 0)
             {
-                memcpy(scsiIoCtx->pdata, readCapacityData, M_Min(8, scsiIoCtx->dataLength));
+                memcpy(scsiIoCtx->pdata, readCapacityData, M_Min(READ_CAPACITY_10_LEN, scsiIoCtx->dataLength));
             }
         }
-        break;
-    case READ_CAPACITY_16:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Read_Capacity_16(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength >= 16)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         //first check the service action
         if (M_GETBITRANGE(scsiIoCtx->cdb[1], 4, 0) == 0x10)
         {
@@ -7847,13 +8503,13 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 //device geometry IOCTLs for remaining data
                 //If Win version great enough, use the access alignment descriptor for block sizes and alignment requirements
 #if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_VISTA
-                PSTORAGE_ACCESS_ALIGNMENT_DESCRIPTOR accessAlignment = NULL;
+                PSTORAGE_ACCESS_ALIGNMENT_DESCRIPTOR accessAlignment = M_NULLPTR;
 #endif //WINVER >= SEA_WIN32_WINNT_VISTA
-                uint8_t readCapacityData[32] = { 0 };
+                DECLARE_ZERO_INIT_ARRAY(uint8_t, readCapacityData, READ_CAPACITY_16_LEN);
 #if defined (WINVER) && WINVER >= SEA_WIN32_WINNT_WIN2K
-                PDISK_GEOMETRY_EX geometryEx = NULL;
-                PDISK_PARTITION_INFO partition = NULL;
-                PDISK_DETECTION_INFO detection = NULL;
+                PDISK_GEOMETRY_EX geometryEx = M_NULLPTR;
+                PDISK_PARTITION_INFO partition = M_NULLPTR;
+                PDISK_DETECTION_INFO detection = M_NULLPTR;
                 if (SUCCESS == win_Get_Drive_Geometry_Ex(scsiIoCtx->device->os_info.fd, &geometryEx, &partition, &detection))
                 {
                     readCapacityData[0] = M_Byte7(C_CAST(uint64_t, geometryEx->DiskSize.QuadPart) / C_CAST(uint64_t, geometryEx->Geometry.BytesPerSector));
@@ -7869,12 +8525,12 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                     readCapacityData[10] = M_Byte1(geometryEx->Geometry.BytesPerSector);
                     readCapacityData[11] = M_Byte0(geometryEx->Geometry.BytesPerSector);
                     //don't set any other fields unless we can get the access alignment descriptor
-                    safe_Free(geometryEx)
+                    safe_free_disk_geometry_ex(&geometryEx);
                 }
                 else
 #endif //WINVER >= SEA_WIN32_WINNT_WIN2K
                 {
-                    PDISK_GEOMETRY geometry = NULL;
+                    PDISK_GEOMETRY geometry = M_NULLPTR;
                     if (SUCCESS == win_Get_Drive_Geometry(scsiIoCtx->device->os_info.fd, &geometry))
                     {
                         uint64_t maxLBA = C_CAST(uint64_t, geometry->Cylinders.QuadPart) * geometry->TracksPerCylinder * geometry->SectorsPerTrack;
@@ -7890,7 +8546,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                         readCapacityData[9] = M_Byte2(geometry->BytesPerSector);
                         readCapacityData[10] = M_Byte1(geometry->BytesPerSector);
                         readCapacityData[11] = M_Byte0(geometry->BytesPerSector);
-                        safe_Free(geometry)
+                        safe_free_disk_geometry(&geometry);
                     }
                     else
                     {
@@ -7934,12 +8590,12 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                         readCapacityData[14] = M_Byte1(lowestAlignedLBA) & 0x3F;//shouldn't cause a problem as alignment shouldn't be higher than this
                         readCapacityData[15] = M_Byte0(lowestAlignedLBA);
                     }
-                    safe_Free(accessAlignment)
+                    safe_free_storage_access_alignment(&accessAlignment);
                 }
 #endif //WINVER >= SEA_WIN32_WINNT_VISTA
                 if (scsiIoCtx->pdata && scsiIoCtx->dataLength > 0)
                 {
-                    memcpy(scsiIoCtx->pdata, readCapacityData, M_Min(32, allocationLength));
+                    memcpy(scsiIoCtx->pdata, readCapacityData, M_Min(READ_CAPACITY_16_LEN, allocationLength));
                 }
             }
         }
@@ -7951,8 +8607,58 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
             ascq = 0x00;
             setSenseData = true;
         }
-        break;
-    case READ6:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Read(ScsiIoCtx* scsiIoCtx, uint64_t lba, bool fua, uint32_t transferLength)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->device && scsiIoCtx->pdata && transferLength > 0 && scsiIoCtx->dataLength > 0 && (transferLength * scsiIoCtx->device->drive_info.deviceBlockSize) == scsiIoCtx->dataLength)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
+        if (fua)
+        {
+            ret = os_Verify(scsiIoCtx->device, lba, transferLength);
+        }
+        if (ret == SUCCESS)
+        {
+            ret = os_Read(scsiIoCtx->device, lba, 0, scsiIoCtx->pdata, (transferLength * scsiIoCtx->device->drive_info.deviceBlockSize));
+        }
+        if (ret != SUCCESS)
+        {
+            //aborted command. TODO: Use windows errors to set more accurate sense data
+            senseKey = SENSE_KEY_ABORTED_COMMAND;
+            asc = 0x00;
+            ascq = 0x00;
+            setSenseData = true;
+        }
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Read_6(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 6)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if (M_GETBITRANGE(scsiIoCtx->cdb[1], 7, 5) != 0)
         {
             //invalid field in CDB
@@ -7969,18 +8675,27 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
             {
                 transferLength = 256;
             }
-            ret = os_Read(scsiIoCtx->device, lba, 0, scsiIoCtx->pdata, transferLength * scsiIoCtx->device->drive_info.deviceBlockSize);
-            if (ret != SUCCESS)
-            {
-                //aborted command. TODO: Use windows errors to set more accurate sense data
-                senseKey = SENSE_KEY_ABORTED_COMMAND;
-                asc = 0x00;
-                ascq = 0x00;
-                setSenseData = true;
-            }
+            ret = wbst_Read(scsiIoCtx, lba, false, transferLength);
         }
-        break;
-    case READ10:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Read_10(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 10)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
+        bool fua = false;
         if (scsiIoCtx->cdb[1] & BIT3)
         {
             fua = true;
@@ -8013,28 +8728,29 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    ret = SUCCESS;
-                    if (fua)
-                    {
-                        ret = os_Verify(scsiIoCtx->device, lba, transferLength);
-                    }
-                    if (ret == SUCCESS)
-                    {
-                        ret = os_Read(scsiIoCtx->device, lba, 0, scsiIoCtx->pdata, transferLength * scsiIoCtx->device->drive_info.deviceBlockSize);
-                    }
-                    if (ret != SUCCESS)
-                    {
-                        //aborted command. TODO: Use windows errors to set more accurate sense data
-                        senseKey = SENSE_KEY_ABORTED_COMMAND;
-                        asc = 0x00;
-                        ascq = 0x00;
-                        setSenseData = true;
-                    }
+                    ret = wbst_Read(scsiIoCtx, lba, fua, transferLength);
                 }
             }
         }
-        break;
-    case READ12:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Read_12(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 12)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
+        bool fua = false;
         if (scsiIoCtx->cdb[1] & BIT3)
         {
             fua = true;
@@ -8067,28 +8783,29 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    ret = SUCCESS;
-                    if (fua)
-                    {
-                        ret = os_Verify(scsiIoCtx->device, lba, transferLength);
-                    }
-                    if (ret == SUCCESS)
-                    {
-                        ret = os_Read(scsiIoCtx->device, lba, false, scsiIoCtx->pdata, transferLength * scsiIoCtx->device->drive_info.deviceBlockSize);
-                    }
-                    if (ret != SUCCESS)
-                    {
-                        //aborted command. TODO: Use windows errors to set more accurate sense data
-                        senseKey = SENSE_KEY_ABORTED_COMMAND;
-                        asc = 0x00;
-                        ascq = 0x00;
-                        setSenseData = true;
-                    }
+                    ret = wbst_Read(scsiIoCtx, lba, fua, transferLength);
                 }
             }
         }
-        break;
-    case READ16:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Read_16(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 16)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
+        bool fua = false;
         if (scsiIoCtx->cdb[1] & BIT3)
         {
             fua = true;
@@ -8124,28 +8841,59 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    ret = SUCCESS;
-                    if (fua)
-                    {
-                        ret = os_Verify(scsiIoCtx->device, lba, transferLength);
-                    }
-                    if (ret == SUCCESS)
-                    {
-                        ret = os_Read(scsiIoCtx->device, lba, false, scsiIoCtx->pdata, transferLength * scsiIoCtx->device->drive_info.deviceBlockSize);
-                    }
-                    if (ret != SUCCESS)
-                    {
-                        //aborted command. TODO: Use windows errors to set more accurate sense data
-                        senseKey = SENSE_KEY_ABORTED_COMMAND;
-                        asc = 0x00;
-                        ascq = 0x00;
-                        setSenseData = true;
-                    }
+                    ret = wbst_Read(scsiIoCtx, lba, fua, transferLength);
                 }
             }
         }
-        break;
-    case WRITE6:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Write(ScsiIoCtx* scsiIoCtx, uint64_t lba, bool fua, uint32_t transferLength)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->device && scsiIoCtx->pdata && transferLength > 0 && scsiIoCtx->dataLength > 0 && (transferLength * scsiIoCtx->device->drive_info.deviceBlockSize) == scsiIoCtx->dataLength)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
+        ret = os_Write(scsiIoCtx->device, lba, false, scsiIoCtx->pdata, (transferLength * scsiIoCtx->device->drive_info.deviceBlockSize));
+        if (fua && ret == SUCCESS)
+        {
+            ret = os_Verify(scsiIoCtx->device, lba, transferLength);
+        }
+        if (ret != SUCCESS)
+        {
+            //aborted command. TODO: Use windows errors to set more accurate sense data
+            senseKey = SENSE_KEY_ABORTED_COMMAND;
+            asc = 0x00;
+            ascq = 0x00;
+            setSenseData = true;
+        }
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Write_6(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 6)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if (M_GETBITRANGE(scsiIoCtx->cdb[1], 7, 5) != 0)
         {
             //invalid field in CDB
@@ -8172,19 +8920,28 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
             }
             else
             {
-                ret = os_Write(scsiIoCtx->device, lba, false, scsiIoCtx->pdata, transferLength * scsiIoCtx->device->drive_info.deviceBlockSize);
-                if (ret != SUCCESS)
-                {
-                    //aborted command. TODO: Use windows errors to set more accurate sense data
-                    senseKey = SENSE_KEY_ABORTED_COMMAND;
-                    asc = 0x00;
-                    ascq = 0x00;
-                    setSenseData = true;
-                }
+                ret = wbst_Write(scsiIoCtx, lba, false, transferLength);
             }
         }
-        break;
-    case WRITE10:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Write_10(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 10)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
+        bool fua = false;
         if (scsiIoCtx->cdb[1] & BIT3)
         {
             fua = true;
@@ -8217,24 +8974,29 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    ret = os_Write(scsiIoCtx->device, lba, false, scsiIoCtx->pdata, transferLength * scsiIoCtx->device->drive_info.deviceBlockSize);
-                    if (fua && ret == SUCCESS)
-                    {
-                        ret = os_Verify(scsiIoCtx->device, lba, transferLength);
-                    }
-                    if (ret != SUCCESS)
-                    {
-                        //aborted command. TODO: Use windows errors to set more accurate sense data
-                        senseKey = SENSE_KEY_ABORTED_COMMAND;
-                        asc = 0x00;
-                        ascq = 0x00;
-                        setSenseData = true;
-                    }
+                    ret = wbst_Write(scsiIoCtx, lba, fua, transferLength);
                 }
             }
         }
-        break;
-    case WRITE12:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Write_12(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 12)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
+        bool fua = false;
         if (scsiIoCtx->cdb[1] & BIT3)
         {
             fua = true;
@@ -8267,24 +9029,29 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    ret = os_Write(scsiIoCtx->device, lba, false, scsiIoCtx->pdata, transferLength * scsiIoCtx->device->drive_info.deviceBlockSize);
-                    if (fua && ret == SUCCESS)
-                    {
-                        ret = os_Verify(scsiIoCtx->device, lba, transferLength);
-                    }
-                    if (ret != SUCCESS)
-                    {
-                        //aborted command. TODO: Use windows errors to set more accurate sense data
-                        senseKey = SENSE_KEY_ABORTED_COMMAND;
-                        asc = 0x00;
-                        ascq = 0x00;
-                        setSenseData = true;
-                    }
+                    ret = wbst_Write(scsiIoCtx, lba, fua, transferLength);
                 }
             }
         }
-        break;
-    case WRITE16:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Write_16(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 16)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
+        bool fua = false;
         if (scsiIoCtx->cdb[1] & BIT3)
         {
             fua = true;
@@ -8319,24 +9086,55 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    ret = os_Write(scsiIoCtx->device, lba, false, scsiIoCtx->pdata, transferLength * scsiIoCtx->device->drive_info.deviceBlockSize);
-                    if (fua && ret == SUCCESS)
-                    {
-                        ret = os_Verify(scsiIoCtx->device, lba, transferLength);
-                    }
-                    if (ret != SUCCESS)
-                    {
-                        //aborted command. TODO: Use windows errors to set more accurate sense data
-                        senseKey = SENSE_KEY_ABORTED_COMMAND;
-                        asc = 0x00;
-                        ascq = 0x00;
-                        setSenseData = true;
-                    }
+                    ret = wbst_Write(scsiIoCtx, lba, fua, transferLength);
                 }
             }
         }
-        break;
-    case VERIFY10:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Verify(ScsiIoCtx* scsiIoCtx, uint64_t lba, uint32_t verificationLength)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->device && verificationLength > 0)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
+        ret = os_Verify(scsiIoCtx->device, lba, verificationLength);
+        if (ret != SUCCESS)
+        {
+            //aborted command. TODO: Use windows errors to set more accurate sense data
+            senseKey = SENSE_KEY_ABORTED_COMMAND;
+            asc = 0x00;
+            ascq = 0x00;
+            setSenseData = true;
+        }
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Verify_10(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 10)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if ((scsiIoCtx->cdb[1] & BIT3)
             || (scsiIoCtx->cdb[1] & BIT0)
             || (M_GETBITRANGE(scsiIoCtx->cdb[6], 7, 6) != 0)
@@ -8350,7 +9148,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
         }
         else
         {
-            uint8_t byteCheck = (scsiIoCtx->cdb[1] >> 1) & 0x03;
+            uint8_t byteCheck = M_GETBITRANGE(scsiIoCtx->cdb[1], 2, 1);
             uint64_t lba = M_BytesTo4ByteValue(scsiIoCtx->cdb[2], scsiIoCtx->cdb[3], scsiIoCtx->cdb[4], scsiIoCtx->cdb[5]);
             uint32_t verificationLength = M_BytesTo2ByteValue(scsiIoCtx->cdb[7], scsiIoCtx->cdb[8]);
             if (verificationLength != 0)//this is allowed and it means to validate inputs and return success
@@ -8365,20 +9163,28 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    ret = os_Verify(scsiIoCtx->device, lba, verificationLength);
-                    if (ret != SUCCESS)
-                    {
-                        //aborted command. TODO: Use windows errors to set more accurate sense data
-                        senseKey = SENSE_KEY_ABORTED_COMMAND;
-                        asc = 0x00;
-                        ascq = 0x00;
-                        setSenseData = true;
-                    }
+                    ret = wbst_Verify(scsiIoCtx, lba, verificationLength);
                 }
             }
         }
-        break;
-    case VERIFY12:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Verify_12(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 12)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if ((scsiIoCtx->cdb[1] & BIT3)
             || (scsiIoCtx->cdb[1] & BIT0)
             || (M_GETBITRANGE(scsiIoCtx->cdb[10], 7, 6) != 0)
@@ -8392,7 +9198,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
         }
         else
         {
-            uint8_t byteCheck = (scsiIoCtx->cdb[1] >> 1) & 0x03;
+            uint8_t byteCheck = M_GETBITRANGE(scsiIoCtx->cdb[1], 2, 1);
             uint64_t lba = M_BytesTo4ByteValue(scsiIoCtx->cdb[2], scsiIoCtx->cdb[3], scsiIoCtx->cdb[4], scsiIoCtx->cdb[5]);
             uint32_t verificationLength = M_BytesTo4ByteValue(scsiIoCtx->cdb[6], scsiIoCtx->cdb[7], scsiIoCtx->cdb[8], scsiIoCtx->cdb[9]);
             if (verificationLength != 0)//this is allowed and it means to validate inputs and return success
@@ -8407,20 +9213,28 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    ret = os_Verify(scsiIoCtx->device, lba, verificationLength);
-                    if (ret != SUCCESS)
-                    {
-                        //aborted command. TODO: Use windows errors to set more accurate sense data
-                        senseKey = SENSE_KEY_ABORTED_COMMAND;
-                        asc = 0x00;
-                        ascq = 0x00;
-                        setSenseData = true;
-                    }
+                    ret = wbst_Verify(scsiIoCtx, lba, verificationLength);
                 }
             }
         }
-        break;
-    case VERIFY16:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Verify_16(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 16)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if ((scsiIoCtx->cdb[1] & BIT3)
             || (scsiIoCtx->cdb[1] & BIT0)
             || (M_GETBITRANGE(scsiIoCtx->cdb[14], 7, 6) != 0)
@@ -8434,7 +9248,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
         }
         else
         {
-            uint8_t byteCheck = (scsiIoCtx->cdb[1] >> 1) & 0x03;
+            uint8_t byteCheck = M_GETBITRANGE(scsiIoCtx->cdb[1], 2, 1);
             uint64_t lba = M_BytesTo8ByteValue(scsiIoCtx->cdb[2], scsiIoCtx->cdb[3], scsiIoCtx->cdb[4], scsiIoCtx->cdb[5], scsiIoCtx->cdb[6], scsiIoCtx->cdb[7], scsiIoCtx->cdb[8], scsiIoCtx->cdb[9]);
             uint32_t verificationLength = M_BytesTo4ByteValue(scsiIoCtx->cdb[10], scsiIoCtx->cdb[11], scsiIoCtx->cdb[12], scsiIoCtx->cdb[13]);
             if (verificationLength != 0)//this is allowed and it means to validate inputs and return success
@@ -8449,20 +9263,28 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 }
                 else
                 {
-                    ret = os_Verify(scsiIoCtx->device, lba, verificationLength);
-                    if (ret != SUCCESS)
-                    {
-                        //aborted command. TODO: Use windows errors to set more accurate sense data
-                        senseKey = SENSE_KEY_ABORTED_COMMAND;
-                        asc = 0x00;
-                        ascq = 0x00;
-                        setSenseData = true;
-                    }
+                    ret = wbst_Verify(scsiIoCtx, lba, verificationLength);
                 }
             }
         }
-        break;
-    case SYNCHRONIZE_CACHE_10:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Synchronize_Cache_10(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 10)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if (scsiIoCtx->cdb[1] != 0 || scsiIoCtx->cdb[6] != 0)
         {
             //invalid field in CDB
@@ -8483,8 +9305,24 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 setSenseData = true;
             }
         }
-        break;
-    case SYNCHRONIZE_CACHE_16_CMD:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Synchronize_Cache_16(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 16)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if (scsiIoCtx->cdb[1] != 0 || scsiIoCtx->cdb[14] != 0)
         {
             //invalid field in CDB
@@ -8505,8 +9343,24 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 setSenseData = true;
             }
         }
-        break;
-    case TEST_UNIT_READY_CMD:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Test_Unit_Ready(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 6)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if (scsiIoCtx->cdb[1] != 0 || scsiIoCtx->cdb[2] != 0 || scsiIoCtx->cdb[3] != 0 || scsiIoCtx->cdb[4] != 0)
         {
             //invalid field in CDB
@@ -8519,8 +9373,24 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
         {
             //Do nothing. Just return ready unless we find some IO we can send that does a TUR type of check - TJE
         }
-        break;
-    case REQUEST_SENSE_CMD:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Request_Sense(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 6)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         if (scsiIoCtx->cdb[1] != 0 || scsiIoCtx->cdb[2] != 0 || scsiIoCtx->cdb[3] != 0)
         {
             //invalid field in CDB
@@ -8534,11 +9404,27 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
             //Do nothing. Return good sense (all zeros) to the call since there is nothing that can really be checked here.
             if (scsiIoCtx->pdata && scsiIoCtx->dataLength > 0)
             {
-                memset(scsiIoCtx->pdata, 0, M_Min(scsiIoCtx->cdb[4], scsiIoCtx->dataLength));
+                explicit_zeroes(scsiIoCtx->pdata, M_Min(scsiIoCtx->cdb[4], scsiIoCtx->dataLength));
             }
         }
-        break;
-    case SEND_DIAGNOSTIC_CMD:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Send_Diagnostic(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 6)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         //only allow self-test bit set to one, and return good status.
         if (scsiIoCtx->cdb[1] & 0xFB //only allow self-test bit to be set to 1. All others are not supported.
             || scsiIoCtx->cdb[2] != 0 //reserved
@@ -8556,8 +9442,24 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
         {
             //regardless of the self test bit being 1 or 0, return good status since there is nothing that can be done right here
         }
-        break;
-    case REPORT_LUNS_CMD:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+static eReturnValues wbst_Report_Luns(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 12)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         //filter out unsupported fields first
         if (scsiIoCtx->cdb[1] != 0
             || scsiIoCtx->cdb[3] != 0
@@ -8574,21 +9476,21 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
         }
         else
         {
-            uint8_t reportLunsData[16] = { 0 };
+            DECLARE_ZERO_INIT_ARRAY(uint8_t, reportLunsData, REPORT_LUNS_MIN_LENGTH);
             uint32_t allocationLength = M_BytesTo4ByteValue(scsiIoCtx->cdb[6], scsiIoCtx->cdb[7], scsiIoCtx->cdb[8], scsiIoCtx->cdb[9]);
             switch (scsiIoCtx->cdb[2])
             {
             case 0x00:
                 //set list length to 16 bytes
-                reportLunsData[0] = M_Byte3(16);
-                reportLunsData[1] = M_Byte2(16);
-                reportLunsData[2] = M_Byte1(16);
-                reportLunsData[3] = M_Byte0(16);
+                reportLunsData[0] = M_Byte3(REPORT_LUNS_MIN_LENGTH);
+                reportLunsData[1] = M_Byte2(REPORT_LUNS_MIN_LENGTH);
+                reportLunsData[2] = M_Byte1(REPORT_LUNS_MIN_LENGTH);
+                reportLunsData[3] = M_Byte0(REPORT_LUNS_MIN_LENGTH);
                 //set lun to zero since it's zero indexed
                 reportLunsData[15] = 0;
                 if (scsiIoCtx->pdata)
                 {
-                    memcpy(scsiIoCtx->pdata, reportLunsData, M_Min(16, allocationLength));
+                    memcpy(scsiIoCtx->pdata, reportLunsData, M_Min(REPORT_LUNS_MIN_LENGTH, allocationLength));
                 }
                 break;
             case 0x01:
@@ -8599,7 +9501,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 //nothing to report, so just copy back the data buffer as it is
                 if (scsiIoCtx->pdata)
                 {
-                    memcpy(scsiIoCtx->pdata, reportLunsData, M_Min(16, allocationLength));
+                    memcpy(scsiIoCtx->pdata, reportLunsData, M_Min(REPORT_LUNS_MIN_LENGTH, allocationLength));
                 }
                 break;
             default:
@@ -8611,8 +9513,26 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 break;
             }
         }
-        break;
-    case SCSI_FORMAT_UNIT_CMD:
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
+}
+
+//TODO: This can be broken down into other functions to make this shorter and easier to follow.
+//      Since this is extremely unlikely to be used as "basic" devices are not very common, it is left like this for now-TJE
+static eReturnValues wbst_Format_Unit(ScsiIoCtx* scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength == 6)
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        bool setSenseData = false;
         //NOTE: There is a format IOCTL not implemented, but it is likely only for floppy drives.
         //      It may be worth implementing if they ever return from beyond the grave...or if we can test and prove it works on HDDs
         //Ideally this is a nop and it returns that it's ready without actually doing anything
@@ -8634,7 +9554,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
             bool longList = scsiIoCtx->cdb[1] & BIT5;
             bool formatData = scsiIoCtx->cdb[1] & BIT4;
             uint8_t defectListFormat = M_GETBITRANGE(scsiIoCtx->cdb[1], 2, 0);
-            if (formatData)
+            if (formatData && scsiIoCtx->pdata && scsiIoCtx->dataLength > 4)
             {
                 //Parameter header information
                 //uint8_t protectionFieldUsage = M_GETBITRANGE(scsiIoCtx->pdata[0], 2, 0);
@@ -8650,7 +9570,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 uint8_t p_i_information = 0;
                 uint8_t protectionIntervalExponent = 0;
                 uint32_t defectListLength = 0;
-                if (longList)
+                if (longList && scsiIoCtx->dataLength > 8)
                 {
                     p_i_information = M_Nibble1(scsiIoCtx->pdata[3]);
                     protectionIntervalExponent = M_Nibble0(scsiIoCtx->pdata[3]);
@@ -8702,7 +9622,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                         uint8_t initializationPatternByte0ReservedBits = 0;//so we can make sure no invalid field was set.
                         uint8_t initializationPatternType = 0;
                         uint16_t initializationPatternLength = 0;
-                        uint8_t *initializationPatternPtr = NULL;
+                        uint8_t* initializationPatternPtr = M_NULLPTR;
                         if (initializationPattern)
                         {
                             //Set up the initialization pattern information since we were given one
@@ -8773,7 +9693,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                                     uint32_t writeSectors64K = 65535 / scsiIoCtx->device->drive_info.deviceBlockSize;
                                     //Write commands
                                     uint32_t writeDataLength = writeSectors64K * scsiIoCtx->device->drive_info.deviceBlockSize;
-                                    uint8_t *writePattern = C_CAST(uint8_t*, calloc_aligned(writeSectors64K, sizeof(uint8_t), scsiIoCtx->device->os_info.minimumAlignment));
+                                    uint8_t* writePattern = C_CAST(uint8_t*, safe_calloc_aligned(writeSectors64K, sizeof(uint8_t), scsiIoCtx->device->os_info.minimumAlignment));
                                     if (writePattern)
                                     {
                                         uint32_t numberOfLBAs = writeDataLength / scsiIoCtx->device->drive_info.deviceBlockSize;
@@ -8807,7 +9727,7 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                                             ascq = 0x00;
                                             setSenseData = true;
                                         }
-                                        safe_Free_aligned(writePattern)
+                                        safe_free_aligned(&writePattern);
                                     }
                                     else
                                     {
@@ -8841,44 +9761,112 @@ static int win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
                 //just return success. This is similar to SAT translation, which influenced this decision
             }
         }
-        break;
-    default:
-        //invalid operation code
-        senseKey = SENSE_KEY_ILLEGAL_REQUEST;
-        asc = 0x20;
-        ascq = 0x00;
-        setSenseData = true;
-        break;
+        wbst_Set_Sense_Data(scsiIoCtx, setSenseData, senseKey, asc, ascq);
     }
-    if (setSenseData && scsiIoCtx->psense)
+    else
     {
-        scsiIoCtx->psense[0] = 0x70;
-        //sense key
-        scsiIoCtx->psense[2] |= M_Nibble0(senseKey);
-        //asc
-        scsiIoCtx->psense[12] = asc;
-        //ascq
-        scsiIoCtx->psense[13] = ascq;
-        //additional sense length
-        scsiIoCtx->psense[7] = 10;
+        ret = BAD_PARAMETER;
     }
-    else if(scsiIoCtx->psense)
+    return ret;
+}
+
+//This basic translation is for odd or old devices that aren't supporting passthrough.
+//It is set to be more basic, while still fulfilling some required SCSI commands to make
+//sure that upper layer code is happy with what this is reporting.
+//This may be able to be expanded, but don't count on it too much.
+//Expansion could come in VPD pages, maybe mode pages (read only most likely). But that is more than needed for now.
+static eReturnValues win_Basic_SCSI_Translation(ScsiIoCtx *scsiIoCtx)
+{
+    eReturnValues ret = SUCCESS;
+    if (scsiIoCtx && scsiIoCtx->cdbLength >= 6)//6byte CDB is shortest allowed
     {
-        memset(scsiIoCtx->psense, 0, scsiIoCtx->senseDataSize);
+        switch (scsiIoCtx->cdb[OPERATION_CODE])
+        {
+        case INQUIRY_CMD:
+            ret = wbst_Inquiry(scsiIoCtx);
+            break;
+        case READ_CAPACITY_10:
+            ret = wbst_Read_Capacity_10(scsiIoCtx);
+            break;
+        case READ_CAPACITY_16:
+            ret = wbst_Read_Capacity_16(scsiIoCtx);
+            break;
+        case READ6:
+            ret = wbst_Read_6(scsiIoCtx);
+            break;
+        case READ10:
+            ret = wbst_Read_10(scsiIoCtx);
+            break;
+        case READ12:
+            ret = wbst_Read_12(scsiIoCtx);
+            break;
+        case READ16:
+            ret = wbst_Read_16(scsiIoCtx);
+            break;
+        case WRITE6:
+            ret = wbst_Write_6(scsiIoCtx);
+            break;
+        case WRITE10:
+            ret = wbst_Write_10(scsiIoCtx);
+            break;
+        case WRITE12:
+            ret = wbst_Write_12(scsiIoCtx);
+            break;
+        case WRITE16:
+            ret = wbst_Write_16(scsiIoCtx);
+            break;
+        case VERIFY10:
+            ret = wbst_Verify_10(scsiIoCtx);
+            break;
+        case VERIFY12:
+            ret = wbst_Verify_12(scsiIoCtx);
+            break;
+        case VERIFY16:
+            ret = wbst_Verify_16(scsiIoCtx);
+            break;
+        case SYNCHRONIZE_CACHE_10:
+            ret = wbst_Synchronize_Cache_10(scsiIoCtx);
+            break;
+        case SYNCHRONIZE_CACHE_16_CMD:
+            ret = wbst_Synchronize_Cache_16(scsiIoCtx);
+            break;
+        case TEST_UNIT_READY_CMD:
+            ret = wbst_Test_Unit_Ready(scsiIoCtx);
+            break;
+        case REQUEST_SENSE_CMD:
+            ret = wbst_Request_Sense(scsiIoCtx);
+            break;
+        case SEND_DIAGNOSTIC_CMD:
+            ret = wbst_Send_Diagnostic(scsiIoCtx);
+            break;
+        case REPORT_LUNS_CMD:
+            ret = wbst_Report_Luns(scsiIoCtx);
+            break;
+        case SCSI_FORMAT_UNIT_CMD:
+            ret = wbst_Format_Unit(scsiIoCtx);
+            break;
+        default:
+            //invalid operation code
+            wbst_Set_Sense_Data(scsiIoCtx, true, SENSE_KEY_ILLEGAL_REQUEST, 0x20, 0x00);
+            break;
+        }
+    }
+    else
+    {
+        ret = BAD_PARAMETER;
     }
     return ret;
 }
 
 // \return SUCCESS - pass, !SUCCESS fail or something went wrong
-int send_IO( ScsiIoCtx *scsiIoCtx )
+eReturnValues send_IO( ScsiIoCtx *scsiIoCtx )
 {
-    int ret = OS_PASSTHROUGH_FAILURE;
+    eReturnValues ret = OS_PASSTHROUGH_FAILURE;
     if (VERBOSITY_BUFFERS <= scsiIoCtx->device->deviceVerbosity)
     {
         printf("Sending command with send_IO\n");
     }
-#if WINVER >= SEA_WIN32_WINNT_WINBLUE
-    //TODO: We should figure out a better way to handle when to use the Windows API for these IOs than this...not sure if there should be a function called "is command in Win API" or something like that to check for it or not.-TJE
+#if WINVER >= SEA_WIN32_WINNT_WINBLUE && defined (IOCTL_SCSI_MINIPORT_FIRMWARE)
     if (is_Firmware_Download_Command_Compatible_With_Win_API(scsiIoCtx))
     {
         if (scsiIoCtx->device->os_info.fwdlMiniportSupported)
@@ -8919,7 +9907,6 @@ int send_IO( ScsiIoCtx *scsiIoCtx )
             {
                 if (scsiIoCtx->device->drive_info.drive_type == ATAPI_DRIVE)//ATAPI drives should just receive the CDB to do what they will with it
                 {
-                    //TODO: Should we check if this is a SAT ATA pass-through command?
                     ret = send_SCSI_Pass_Through_IO(scsiIoCtx);
                 }
                 //else if (scsiIoCtx->pAtaCmdOpts->tfr.CommandStatus == ATA_IDENTIFY)//TODO: make sure all other LBA registers are zero
@@ -9003,7 +9990,7 @@ int send_IO( ScsiIoCtx *scsiIoCtx )
             }
             break;
         case RAID_INTERFACE:
-            if (scsiIoCtx->device->issue_io != NULL)
+            if (scsiIoCtx->device->issue_io != M_NULLPTR)
             {
                 ret = scsiIoCtx->device->issue_io(scsiIoCtx);
             }
@@ -9027,27 +10014,36 @@ int send_IO( ScsiIoCtx *scsiIoCtx )
 #if WINVER >= SEA_WIN32_WINNT_WIN10
     }
 #endif
+    if (scsiIoCtx->device->delay_io)
+    {
+        delay_Milliseconds(scsiIoCtx->device->delay_io);
+        if (VERBOSITY_COMMAND_NAMES <= scsiIoCtx->device->deviceVerbosity)
+        {
+            printf("Delaying between commands %d seconds to reduce IO impact", scsiIoCtx->device->delay_io);
+        }
+    }
     return ret;
 }
-
-#if !defined(DISABLE_NVME_PASSTHROUGH)
 
 #if WINVER >= SEA_WIN32_WINNT_WIN10
 /*
     MS Windows treats specification commands different from Vendor Unique Commands.
 */
 #define NVME_ERROR_ENTRY_LENGTH 64
-static int send_NVMe_Vendor_Unique_IO(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues send_NVMe_Vendor_Unique_IO(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     uint32_t nvmePassthroughDataSize = nvmeIoCtx->dataSize + sizeof(STORAGE_PROTOCOL_COMMAND) + STORAGE_PROTOCOL_COMMAND_LENGTH_NVME + NVME_ERROR_ENTRY_LENGTH;
     if (nvmeIoCtx->commandDirection == XFER_DATA_IN_OUT || nvmeIoCtx->commandDirection == XFER_DATA_OUT_IN)
     {
         //assuming bidirectional commands have the same amount of data transferring in each direction
-        //TODO: Validate that this assumption is actually correct.
         nvmePassthroughDataSize += nvmeIoCtx->dataSize;
     }
     uint8_t *commandBuffer = C_CAST(uint8_t*, _aligned_malloc(nvmePassthroughDataSize, 8));
+    if (!commandBuffer)
+    {
+        return MEMORY_FAILURE;
+    }
     memset(commandBuffer, 0, nvmePassthroughDataSize);
 
     //Setup the storage protocol command structure.
@@ -9064,21 +10060,20 @@ static int send_NVMe_Vendor_Unique_IO(nvmeCmdCtx *nvmeIoCtx)
     {
         protocolCommand->CommandSpecific = STORAGE_PROTOCOL_SPECIFIC_NVME_ADMIN_COMMAND;
         protocolCommand->Flags = STORAGE_PROTOCOL_COMMAND_FLAG_ADAPTER_REQUEST;
-        nvmeAdminCommand *command = (nvmeAdminCommand*)&protocolCommand->Command;
+        nvmeAdminCommand *command = C_CAST(nvmeAdminCommand*, &protocolCommand->Command);
         memcpy(command, &nvmeIoCtx->cmd.adminCmd, STORAGE_PROTOCOL_COMMAND_LENGTH_NVME);
     }
     else
     {
         protocolCommand->CommandSpecific = STORAGE_PROTOCOL_SPECIFIC_NVME_NVM_COMMAND;
-        nvmCommand *command = (nvmCommand*)&protocolCommand->Command;
+        nvmCommand *command = C_CAST(nvmCommand*, &protocolCommand->Command);
         memcpy(command, &nvmeIoCtx->cmd.nvmCmd, STORAGE_PROTOCOL_COMMAND_LENGTH_NVME);
     }
 
-    //TODO: Save error info? Seems to be from NVMe error log
+    //Save error info? Seems to be from NVMe error log
     protocolCommand->ErrorInfoLength = NVME_ERROR_ENTRY_LENGTH;
     protocolCommand->ErrorInfoOffset = FIELD_OFFSET(STORAGE_PROTOCOL_COMMAND, Command) + STORAGE_PROTOCOL_COMMAND_LENGTH_NVME;
 
-    //TODO: If we stor the error info (NVMe error log info) in this structure, we will need to adjust the data offsets below
     switch (nvmeIoCtx->commandDirection)
     {
     case XFER_DATA_IN:
@@ -9119,24 +10114,24 @@ static int send_NVMe_Vendor_Unique_IO(nvmeCmdCtx *nvmeIoCtx)
 
     if (nvmeIoCtx->timeout > WIN_MAX_CMD_TIMEOUT_SECONDS || nvmeIoCtx->device->drive_info.defaultTimeoutSeconds > WIN_MAX_CMD_TIMEOUT_SECONDS)
     {
-        safe_Free_aligned(commandBuffer)
+        safe_free_aligned(&commandBuffer);
         return OS_TIMEOUT_TOO_LARGE;
     }
 
-    if (nvmeIoCtx->timeout == 0)
+    if (nvmeIoCtx->device->drive_info.defaultTimeoutSeconds > 0 && nvmeIoCtx->device->drive_info.defaultTimeoutSeconds > nvmeIoCtx->timeout)
     {
-        if (nvmeIoCtx->device->drive_info.defaultTimeoutSeconds)
+        protocolCommand->TimeOutValue = nvmeIoCtx->device->drive_info.defaultTimeoutSeconds;
+    }
+    else
+    {
+        if (nvmeIoCtx->timeout != 0)
         {
-            protocolCommand->TimeOutValue = nvmeIoCtx->device->drive_info.defaultTimeoutSeconds;
+            protocolCommand->TimeOutValue = nvmeIoCtx->timeout;
         }
         else
         {
             protocolCommand->TimeOutValue = 15;
         }
-    }
-    else
-    {
-        protocolCommand->TimeOutValue = nvmeIoCtx->timeout;
     }
 
     //Command has been set up, so send it!
@@ -9144,7 +10139,7 @@ static int send_NVMe_Vendor_Unique_IO(nvmeCmdCtx *nvmeIoCtx)
     nvmeIoCtx->device->os_info.last_error = 0;
     OVERLAPPED overlappedStruct;
     memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-    overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
     seatimer_t commandTimer;
     DWORD returned_data = 0;
     memset(&commandTimer, 0, sizeof(seatimer_t));
@@ -9171,7 +10166,7 @@ static int send_NVMe_Vendor_Unique_IO(nvmeCmdCtx *nvmeIoCtx)
     if (overlappedStruct.hEvent)
     {
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
     }
     if (success)
     {
@@ -9207,14 +10202,13 @@ static int send_NVMe_Vendor_Unique_IO(nvmeCmdCtx *nvmeIoCtx)
         uint32_t nsid = M_BytesTo4ByteValue(commandBuffer[protocolCommand->ErrorInfoOffset + 27], commandBuffer[protocolCommand->ErrorInfoOffset + 26], commandBuffer[protocolCommand->ErrorInfoOffset + 25], commandBuffer[protocolCommand->ErrorInfoOffset + 24]);
         uint8_t vendorSpecific = commandBuffer[protocolCommand->ErrorInfoOffset + 28];
         uint64_t commandSpecific = M_BytesTo8ByteValue(commandBuffer[protocolCommand->ErrorInfoOffset + 39], commandBuffer[protocolCommand->ErrorInfoOffset + 38], commandBuffer[protocolCommand->ErrorInfoOffset + 37], commandBuffer[protocolCommand->ErrorInfoOffset + 36], commandBuffer[protocolCommand->ErrorInfoOffset + 35], commandBuffer[protocolCommand->ErrorInfoOffset + 34], commandBuffer[protocolCommand->ErrorInfoOffset + 33], commandBuffer[protocolCommand->ErrorInfoOffset + 32]);
-        //TODO: This is useful for debugging but may not want it showing otherwise!!!
         if (errorCount > 0)
         {
             printf("Win 10 VU IO Error Info:\n");
             printf("\tError Count: %" PRIu64 "\n", errorCount);
             printf("\tSQID: %" PRIu16 "\n", submissionQueueID);
             printf("\tCID: %" PRIu16 "\n", commandID);
-            printf("\tStatus: %" PRIu16"\n", statusField);
+            printf("\tStatus: %" PRIu16 "\n", statusField);
             printf("\tParameterErrorLocation: %" PRIu16 "\n", parameterErrorLocation);
             printf("\tLBA: %" PRIu64 "\n", lba);
             printf("\tNSID: %" PRIu32 "\n", nsid);
@@ -9224,7 +10218,7 @@ static int send_NVMe_Vendor_Unique_IO(nvmeCmdCtx *nvmeIoCtx)
     }
 #endif
 
-    //TODO: figure out if we need to check this return status or not.
+    //not checking this today since we have the raw drive error response to use instead.
     /*switch (pNVMeWinCtx->storageProtocolCommand.ReturnStatus)
     {
     case STORAGE_PROTOCOL_STATUS_PENDING:
@@ -9243,22 +10237,21 @@ static int send_NVMe_Vendor_Unique_IO(nvmeCmdCtx *nvmeIoCtx)
     nvmeIoCtx->commandCompletionData.dw0Valid = true;
     nvmeIoCtx->commandCompletionData.statusAndCID = protocolCommand->ErrorCode;
     nvmeIoCtx->commandCompletionData.dw3Valid = true;
-    //TODO: do we need this error code, or do we look at the error info offset for the provided length???
     //set last command time
     nvmeIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
     //check how long it took to set timeout error if necessary
     if (get_Seconds(commandTimer) > protocolCommand->TimeOutValue)
     {
-        ret = COMMAND_TIMEOUT;
+        ret = OS_COMMAND_TIMEOUT;
     }
     _aligned_free(commandBuffer);
-    commandBuffer = NULL;
+    commandBuffer = M_NULLPTR;
     return ret;
 }
 
-static int win10_Translate_Identify_Active_Namespace_ID_List(nvmeCmdCtx* nvmeIoCtx)
+static eReturnValues win10_Translate_Identify_Active_Namespace_ID_List(nvmeCmdCtx* nvmeIoCtx)
 {
-    int ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     //return invalid namespace or format if NSID >= FFFFFFFEh or FFFFFFFFh
     //CNTID is not used. If non-zero, return an error for invalid field in cmd???
     if (nvmeIoCtx->cmd.adminCmd.nsid >= 0xFFFFFFFE)
@@ -9281,7 +10274,7 @@ static int win10_Translate_Identify_Active_Namespace_ID_List(nvmeCmdCtx* nvmeIoC
         //report LUNs uses 64bits for each lun. NVMe uses 32bits for each NSID.
         //This command describes 1024 NSIDs, so we can request the whole thing, then translate/filter as needed - TJE
         uint32_t reportLunsDataSize = 16 + (1024 * 8);//131072B
-        uint8_t* reportLunsData = C_CAST(uint8_t*, calloc_aligned(reportLunsDataSize, sizeof(uint8_t), nvmeIoCtx->device->os_info.minimumAlignment));
+        uint8_t* reportLunsData = C_CAST(uint8_t*, safe_calloc_aligned(reportLunsDataSize, sizeof(uint8_t), nvmeIoCtx->device->os_info.minimumAlignment));
         if (reportLunsData)
         {
             memset(nvmeIoCtx->ptrData, 0, nvmeIoCtx->dataSize);
@@ -9309,7 +10302,7 @@ static int win10_Translate_Identify_Active_Namespace_ID_List(nvmeCmdCtx* nvmeIoC
             {
                 ret = OS_PASSTHROUGH_FAILURE;
             }
-            safe_Free_aligned(reportLunsData);
+            safe_free_aligned(&reportLunsData);
         }
         else
         {
@@ -9331,9 +10324,9 @@ static int win10_Translate_Identify_Active_Namespace_ID_List(nvmeCmdCtx* nvmeIoC
 #define NVME_IDENTIFY_CNS_ACTIVE_NAMESPACES 2
 #endif
 
-static int send_Win_NVMe_Identify_Cmd(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues send_Win_NVMe_Identify_Cmd(nvmeCmdCtx *nvmeIoCtx)
 {
-    int     ret = SUCCESS;
+    eReturnValues ret = SUCCESS;
     uint8_t cnsValue = M_Byte0(nvmeIoCtx->cmd.adminCmd.cdw10);
     if (cnsValue == 2)
     {
@@ -9348,21 +10341,21 @@ static int send_Win_NVMe_Identify_Cmd(nvmeCmdCtx *nvmeIoCtx)
     else
     {
         BOOL    result;
-        PVOID   buffer = NULL;
+        PVOID   buffer = M_NULLPTR;
         ULONG   bufferLength = 0;
         ULONG   returnedLength = 0;
 
-        PSTORAGE_PROPERTY_QUERY query = NULL;
-        PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = NULL;
-        PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = NULL;
+        PSTORAGE_PROPERTY_QUERY query = M_NULLPTR;
+        PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = M_NULLPTR;
+        //PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = M_NULLPTR;
 
         //
         // Allocate buffer for use.
         //
         bufferLength = FIELD_OFFSET(STORAGE_PROPERTY_QUERY, AdditionalParameters) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) + NVME_IDENTIFY_DATA_LEN;
-        buffer = malloc(bufferLength);
+        buffer = safe_malloc(bufferLength);
 
-        if (buffer == NULL)
+        if (buffer == M_NULLPTR)
         {
 #if defined (_DEBUG)
             printf("%s: allocate buffer failed, exit", __FUNCTION__);
@@ -9376,14 +10369,14 @@ static int send_Win_NVMe_Identify_Cmd(nvmeCmdCtx *nvmeIoCtx)
         ZeroMemory(buffer, bufferLength);
 
         query = C_CAST(PSTORAGE_PROPERTY_QUERY, buffer);
-        protocolDataDescr = C_CAST(PSTORAGE_PROTOCOL_DATA_DESCRIPTOR, buffer);
+        //protocolDataDescr = C_CAST(PSTORAGE_PROTOCOL_DATA_DESCRIPTOR, buffer);
         protocolData = C_CAST(PSTORAGE_PROTOCOL_SPECIFIC_DATA, query->AdditionalParameters);
 
         //check that the rest of dword 10 is zero!
         if ((nvmeIoCtx->cmd.adminCmd.cdw10 >> 8) != 0)
         {
             //these bytes are reserved in NVMe 1.2 which is the highest MS supports right now. - TJE
-            safe_Free(buffer)
+            safe_free(&buffer);
                 return OS_COMMAND_NOT_AVAILABLE;
         }
 
@@ -9401,7 +10394,7 @@ static int send_Win_NVMe_Identify_Cmd(nvmeCmdCtx *nvmeIoCtx)
             query->PropertyId = StorageAdapterProtocolSpecificProperty;
             protocolData->ProtocolDataRequestValue = NVME_IDENTIFY_CNS_ACTIVE_NAMESPACES;
             //NOTE: This command is documented in MSDN, but it doesn't actually work, so we are returning an error instead! - TJE
-            safe_Free(buffer)
+            safe_free(&buffer);
                 return OS_COMMAND_NOT_AVAILABLE;
             //All values below here are added in NVMe 1.3, which MS doesn't support yet! - TJE
         case 3://list of namespace identification descriptor structures
@@ -9413,7 +10406,7 @@ static int send_Win_NVMe_Identify_Cmd(nvmeCmdCtx *nvmeIoCtx)
         case 0x14://primary controller capabilities
         case 0x15://secondary controller list
         default:
-            safe_Free(buffer)
+            safe_free(&buffer);
                 return OS_COMMAND_NOT_AVAILABLE;
         }
 
@@ -9442,7 +10435,7 @@ static int send_Win_NVMe_Identify_Cmd(nvmeCmdCtx *nvmeIoCtx)
             buffer,
             bufferLength,
             &returnedLength,
-            NULL
+            M_NULLPTR
         );
         stop_Timer(&commandTimer);
         nvmeIoCtx->device->os_info.last_error = GetLastError();
@@ -9463,7 +10456,7 @@ static int send_Win_NVMe_Identify_Cmd(nvmeCmdCtx *nvmeIoCtx)
             memcpy(nvmeIoCtx->ptrData, identifyControllerData, nvmeIoCtx->dataSize);
         }
 
-        safe_Free(buffer)
+        safe_free(&buffer);
     }
     return ret;
 }
@@ -9479,25 +10472,61 @@ typedef union _MSFT_NVME_STORAGE_PROTOCOL_DATA_GET_LOG_PAGE_SUB_VALUE_4 {
     ULONG  AsUlong;
 }MSFT_NVME_STORAGE_PROTOCOL_DATA_GET_LOG_PAGE_SUB_VALUE_4, *PMSFT_NVME_STORAGE_PROTOCOL_DATA_GET_LOG_PAGE_SUB_VALUE_4;
 
-static int send_Win_NVMe_Get_Log_Page_Cmd(nvmeCmdCtx *nvmeIoCtx)
-{
-    int32_t returnValue = SUCCESS;
-    BOOL    result;
-    PVOID   buffer = NULL;
-    ULONG   bufferLength = 0;
-    ULONG   returnedLength = 0;
+//WIN_API_TARGET_WIN10_17763 gave offset fields to the get log page through a subvalue input.
+//The documentation online states 1903(WIN_API_TARGET_WIN10_18362) and up support read buffer 16...it is unclear what version first supported the read buffer 16 method to read the telemetry log
+//This function has been defined to read telemetry with the read buffer 16 command. NOTE: Read buffer 10 will NOT work, only 16.
+//this function is only necessary for versions older than 1809...if readbuffer16 is even supported in those old versions.
+//static eReturnValues get_NVMe_Telemetry_Data_With_RB16(nvmeCmdCtx* nvmeIoCtx)
+//{
+//    eReturnValues ret = BAD_PARAMETER;
+//    uint8_t logID = M_Byte0(nvmeIoCtx->cmd.adminCmd.cdw10);
+//    if (nvmeIoCtx->commandType == NVM_ADMIN_CMD && nvmeIoCtx->cmd.adminCmd.opcode == NVME_ADMIN_CMD_GET_LOG_PAGE && (logID == NVME_LOG_TELEMETRY_CTRL_ID || logID == NVME_LOG_TELEMETRY_HOST_ID))
+//    {
+//        ret = SUCCESS;
+//        uint8_t bufferID = 0x10;//Assume host as it is most common to pull
+//        uint64_t numberOfDWords = M_WordsTo4ByteValue(M_Word0(nvmeIoCtx->cmd.adminCmd.cdw11), M_Word1(nvmeIoCtx->cmd.adminCmd.cdw10));
+//        uint64_t logPageOffset = M_DWordsTo8ByteValue(nvmeIoCtx->cmd.adminCmd.cdw13, nvmeIoCtx->cmd.adminCmd.cdw12);
+//        //bool createNewSnapshot = M_ToBool(nvmeIoCtx->cmd.adminCmd.cdw10 & BIT8);
+//        if (logID == NVME_LOG_TELEMETRY_CTRL_ID)
+//        {
+//            bufferID = 0x11;
+//        }
+//        if ((numberOfDWords << 4) > UINT32_MAX)
+//        {
+//            ret = BAD_PARAMETER;
+//            //Invalid Field in Command???
+//            //Data Transfer Error???
+//        }
+//        else
+//        {
+//            //now call the SCSI read-buffer 16 command with the correct parameters to pull the data
+//            //TODO: figure out how the "trigger" to create a new snapshot will work. use the commented out createNewSnapshot above -TJE
+//            ret = scsi_Read_Buffer_16(nvmeIoCtx->device, 0x1C, 0 /*TODO take new snapshot???*/, bufferID, logPageOffset, C_CAST(uint32_t, numberOfDWords << 4), nvmeIoCtx->ptrData);
+//            //TODO: Handle any errors
+//        }
+//    }
+//    return ret;
+//}
 
-    PSTORAGE_PROPERTY_QUERY query = NULL;
-    PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = NULL;
-    PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = NULL;
+static eReturnValues send_Win_NVMe_Get_Log_Page_Cmd(nvmeCmdCtx *nvmeIoCtx)
+{
+    eReturnValues returnValue = SUCCESS;
+    BOOL result;
+    PVOID buffer = M_NULLPTR;
+    ULONG bufferLength = 0;
+    ULONG returnedLength = 0;
+
+    PSTORAGE_PROPERTY_QUERY query = M_NULLPTR;
+    PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = M_NULLPTR;
+    PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = M_NULLPTR;
 
     //
     // Allocate buffer for use.
     //
     bufferLength = FIELD_OFFSET(STORAGE_PROPERTY_QUERY, AdditionalParameters) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) + nvmeIoCtx->dataSize;
-    buffer = malloc(bufferLength);
+    buffer = safe_malloc(bufferLength);
 
-    if (buffer == NULL) {
+    if (buffer == M_NULLPTR) {
 #if defined (_DEBUG)
         printf("%s: allocate buffer failed, exit", __FUNCTION__);
 #endif
@@ -9520,7 +10549,7 @@ static int send_Win_NVMe_Get_Log_Page_Cmd(nvmeCmdCtx *nvmeIoCtx)
     protocolData->DataType = NVMeDataTypeLogPage;
     protocolData->ProtocolDataRequestValue = M_Byte0(nvmeIoCtx->cmd.adminCmd.cdw10);//log id
     protocolData->ProtocolDataRequestSubValue = nvmeIoCtx->cmd.adminCmd.cdw12;//offset lower 32 bits
-    
+
 #if WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_20348
     //20348 gives suv value 4 for the other bit field values
     protocolData->ProtocolDataRequestSubValue2 = nvmeIoCtx->cmd.adminCmd.cdw13;//offset higher 32 bits
@@ -9570,7 +10599,7 @@ static int send_Win_NVMe_Get_Log_Page_Cmd(nvmeCmdCtx *nvmeIoCtx)
         buffer,
         bufferLength,
         &returnedLength,
-        NULL
+        M_NULLPTR
     );
     stop_Timer(&commandTimer);
     nvmeIoCtx->device->os_info.last_error = GetLastError();
@@ -9592,9 +10621,9 @@ static int send_Win_NVMe_Get_Log_Page_Cmd(nvmeCmdCtx *nvmeIoCtx)
         if ((protocolDataDescr->Version != sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR)) ||
             (protocolDataDescr->Size != sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR)))
         {
-            #if defined (_DEBUG)
+#if defined (_DEBUG)
             printf("%s: Error Log - data descriptor header not valid\n", __FUNCTION__);
-            #endif
+#endif
             returnValue = OS_PASSTHROUGH_FAILURE;
         }
 
@@ -9603,9 +10632,9 @@ static int send_Win_NVMe_Get_Log_Page_Cmd(nvmeCmdCtx *nvmeIoCtx)
         if ((protocolData->ProtocolDataOffset < sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA)) ||
             (protocolData->ProtocolDataLength < nvmeIoCtx->dataSize))
         {
-            #if defined (_DEBUG)
+#if defined (_DEBUG)
             printf("%s: Error Log - ProtocolData Offset/Length not valid\n", __FUNCTION__);
-            #endif
+#endif
             returnValue = OS_PASSTHROUGH_FAILURE;
         }
         uint8_t* logData = C_CAST(uint8_t*, C_CAST(PCHAR, protocolData) + protocolData->ProtocolDataOffset);
@@ -9622,25 +10651,26 @@ static int send_Win_NVMe_Get_Log_Page_Cmd(nvmeCmdCtx *nvmeIoCtx)
     return returnValue;
 }
 
-static int send_Win_NVMe_Get_Features_Cmd(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues send_Win_NVMe_Get_Features_Cmd(nvmeCmdCtx *nvmeIoCtx)
 {
-    int32_t returnValue = SUCCESS;
-    BOOL    result;
-    PVOID   buffer = NULL;
-    ULONG   bufferLength = 0;
-    ULONG   returnedLength = 0;
+    eReturnValues returnValue = SUCCESS;
+    BOOL result;
+    PVOID buffer = M_NULLPTR;
+    ULONG bufferLength = 0;
+    ULONG returnedLength = 0;
 
-    PSTORAGE_PROPERTY_QUERY query = NULL;
-    PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = NULL;
-    PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = NULL;
+    PSTORAGE_PROPERTY_QUERY query = M_NULLPTR;
+    PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = M_NULLPTR;
+    PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = M_NULLPTR;
 
     //
     // Allocate buffer for use.
     //
-    bufferLength = FIELD_OFFSET(STORAGE_PROPERTY_QUERY, AdditionalParameters) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) + nvmeIoCtx->dataSize;
-    buffer = malloc(bufferLength);
+    uint32_t nvmeGetFtMinSize = M_Max(4, nvmeIoCtx->dataSize);//This works around get features commands that are not actually transferring any data. If you size the buffer based on a zero data transfer, windows gives an error -TJE
+    bufferLength = FIELD_OFFSET(STORAGE_PROPERTY_QUERY, AdditionalParameters) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) + nvmeGetFtMinSize;
+    buffer = safe_malloc(bufferLength);
 
-    if (buffer == NULL) {
+    if (buffer == M_NULLPTR) {
 #if defined (_DEBUG)
         printf("%s: allocate buffer failed, exit", __FUNCTION__);
 #endif
@@ -9664,7 +10694,7 @@ static int send_Win_NVMe_Get_Features_Cmd(nvmeCmdCtx *nvmeIoCtx)
     protocolData->ProtocolDataRequestValue = M_Byte0(nvmeIoCtx->cmd.adminCmd.cdw10);
     protocolData->ProtocolDataRequestSubValue = nvmeIoCtx->cmd.adminCmd.cdw11;//latest Win API shows using CDW11 in a comment, which is a feature specific value
     protocolData->ProtocolDataOffset = sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA);
-    protocolData->ProtocolDataLength = nvmeIoCtx->dataSize;
+    protocolData->ProtocolDataLength = nvmeGetFtMinSize;
 
     //
     // Send request down.
@@ -9682,9 +10712,9 @@ static int send_Win_NVMe_Get_Features_Cmd(nvmeCmdCtx *nvmeIoCtx)
         buffer,
         bufferLength,
         &returnedLength,
-        NULL
+        M_NULLPTR
     );
-    start_Timer(&commandTimer);
+    stop_Timer(&commandTimer);
     nvmeIoCtx->device->os_info.last_error = GetLastError();
     nvmeIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
     if (!result || (returnedLength == 0))
@@ -9729,14 +10759,14 @@ static int send_Win_NVMe_Get_Features_Cmd(nvmeCmdCtx *nvmeIoCtx)
         nvmeIoCtx->commandCompletionData.dw0Valid = true;
     }
 
-    safe_Free(buffer)
+    safe_free(&buffer);
 
     return returnValue;
 }
 
-static int send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_PASSTHROUGH_FAILURE;
+    eReturnValues ret = OS_PASSTHROUGH_FAILURE;
 #if defined (_DEBUG)
     printf("%s: -->\n", __FUNCTION__);
 #endif
@@ -9755,8 +10785,8 @@ static int send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
     }
     downloadActivate.Slot = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 2, 0);
 #if defined (_DEBUG)
-    printf("%s: downloadActivate->Version=%ld\n\t->Size=%ld\n\t->Flags=0x%lX\n\t->Slot=%d\n",\
-        __FUNCTION__, downloadActivate.Version,downloadActivate.Size, downloadActivate.Flags, downloadActivate.Slot);
+    printf("%s: downloadActivate->Version=%ld\n\t->Size=%ld\n\t->Flags=0x%lX\n\t->Slot=%d\n", \
+        __FUNCTION__, downloadActivate.Version, downloadActivate.Size, downloadActivate.Flags, downloadActivate.Slot);
 #endif
     DWORD returned_data = 0;
     SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
@@ -9764,13 +10794,13 @@ static int send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
     memset(&commandTimer, 0, sizeof(seatimer_t));
     OVERLAPPED overlappedStruct;
     memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-    overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
     start_Timer(&commandTimer);
     int fwdlIO = DeviceIoControl(nvmeIoCtx->device->os_info.fd,
         IOCTL_STORAGE_FIRMWARE_ACTIVATE,
         &downloadActivate,
         sizeof(STORAGE_HW_FIRMWARE_ACTIVATE),
-        NULL,
+        M_NULLPTR,
         0,
         &returned_data,
         &overlappedStruct
@@ -9794,7 +10824,7 @@ static int send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
     if (overlappedStruct.hEvent)
     {
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
     }
     //dummy up sense data for end result
     if (fwdlIO)
@@ -9810,7 +10840,6 @@ static int send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
             printf("Windows Error: ");
             print_Windows_Error_To_Screen(nvmeIoCtx->device->os_info.last_error);
         }
-        //TODO: We need to figure out what error codes Windows will return and how to dummy up the return value to match - TJE
         switch (nvmeIoCtx->device->os_info.last_error)
         {
         case ERROR_IO_DEVICE:
@@ -9828,23 +10857,23 @@ static int send_Win_NVMe_Firmware_Activate_Command(nvmeCmdCtx *nvmeIoCtx)
 //uncomment this flag to switch to force using the older structure if we need to.
 #define DISABLE_FWDL_V2 1
 
-static int send_Win_NVMe_Firmware_Image_Download_Command(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues send_Win_NVMe_Firmware_Image_Download_Command(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_PASSTHROUGH_FAILURE;
+    eReturnValues ret = OS_PASSTHROUGH_FAILURE;
 #if defined (_DEBUG)
     printf("%s: -->\n", __FUNCTION__);
 #endif
     //send download IOCTL
 #if defined (WIN_API_TARGET_VERSION) && !defined (DISABLE_FWDL_V2) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_16299
     DWORD downloadStructureSize = sizeof(STORAGE_HW_FIRMWARE_DOWNLOAD_V2) + nvmeIoCtx->dataSize;
-    PSTORAGE_HW_FIRMWARE_DOWNLOAD_V2 downloadIO = C_CAST(PSTORAGE_HW_FIRMWARE_DOWNLOAD_V2, malloc(downloadStructureSize));
+    PSTORAGE_HW_FIRMWARE_DOWNLOAD_V2 downloadIO = C_CAST(PSTORAGE_HW_FIRMWARE_DOWNLOAD_V2, safe_malloc(downloadStructureSize));
 #if defined (_DEBUG)
     printf("%s: sizeof(STORAGE_HW_FIRMWARE_DOWNLOAD_V2)=%zu+%" PRIu32 "=%ld\n", \
         __FUNCTION__, sizeof(STORAGE_HW_FIRMWARE_DOWNLOAD_V2), nvmeIoCtx->dataSize, downloadStructureSize);
 #endif
 #else
     DWORD downloadStructureSize = sizeof(STORAGE_HW_FIRMWARE_DOWNLOAD) + nvmeIoCtx->dataSize;
-    PSTORAGE_HW_FIRMWARE_DOWNLOAD downloadIO = C_CAST(PSTORAGE_HW_FIRMWARE_DOWNLOAD, malloc(downloadStructureSize));
+    PSTORAGE_HW_FIRMWARE_DOWNLOAD downloadIO = C_CAST(PSTORAGE_HW_FIRMWARE_DOWNLOAD, safe_malloc(downloadStructureSize));
 #if defined (_DEBUG)
     printf("%s: sizeof(STORAGE_HW_FIRMWARE_DOWNLOAD)=%zu\n", __FUNCTION__, sizeof(STORAGE_HW_FIRMWARE_DOWNLOAD));
 #endif
@@ -9875,7 +10904,6 @@ static int send_Win_NVMe_Firmware_Image_Download_Command(nvmeCmdCtx *nvmeIoCtx)
         downloadIO->Flags |= STORAGE_HW_FIRMWARE_REQUEST_FLAG_FIRST_SEGMENT;
     }
 #endif
-    //TODO: add firmware slot number?
     downloadIO->Slot = STORAGE_HW_FIRMWARE_INVALID_SLOT;// M_GETBITRANGE(nvmeIoCtx->cmd, 1, 0);
     //we need to set the offset since MS uses this in the command sent to the device.
     downloadIO->Offset = C_CAST(uint64_t, nvmeIoCtx->cmd.adminCmd.cdw11) << 2;//convert #DWords to bytes for offset
@@ -9900,13 +10928,13 @@ static int send_Win_NVMe_Firmware_Image_Download_Command(nvmeCmdCtx *nvmeIoCtx)
     memset(&commandTimer, 0, sizeof(seatimer_t));
     OVERLAPPED overlappedStruct;
     memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-    overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
     start_Timer(&commandTimer);
     int fwdlIO = DeviceIoControl(nvmeIoCtx->device->os_info.fd,
         IOCTL_STORAGE_FIRMWARE_DOWNLOAD,
         downloadIO,
         downloadStructureSize,
-        NULL,
+        M_NULLPTR,
         0,
         &returned_data,
         &overlappedStruct
@@ -9930,7 +10958,7 @@ static int send_Win_NVMe_Firmware_Image_Download_Command(nvmeCmdCtx *nvmeIoCtx)
     if (overlappedStruct.hEvent)
     {
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
     }
     //dummy up sense data for end result
     if (fwdlIO)
@@ -9948,7 +10976,6 @@ static int send_Win_NVMe_Firmware_Image_Download_Command(nvmeCmdCtx *nvmeIoCtx)
             printf("Windows Error: ");
             print_Windows_Error_To_Screen(nvmeIoCtx->device->os_info.last_error);
         }
-        //TODO: We need to figure out what error codes Windows will return and how to dummy up the return value to match - TJE
         switch (nvmeIoCtx->device->os_info.last_error)
         {
         case ERROR_IO_DEVICE://aborted command is the best we can do
@@ -9963,16 +10990,15 @@ static int send_Win_NVMe_Firmware_Image_Download_Command(nvmeCmdCtx *nvmeIoCtx)
     return ret;
 }
 
-static int win10_Translate_Security_Send(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues win10_Translate_Security_Send(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     //Windows API call does not exist...need to issue a SCSI IO and let the driver translate it for us...how silly
     if (M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 7, 0) == 0)//check that the nvme specific field isn't set since we can't issue that
     {
         //turn verbosity to silent since we don't need to see everything from issueing the scsi io...purpose right now is to make it look like an NVM io and be transparent to the caller.
         nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
-        //TODO: Should we add some of our own verbosity output here???
         ret = scsi_SecurityProtocol_Out(nvmeIoCtx->device, M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 31, 24), M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 23, 8), false, nvmeIoCtx->cmd.adminCmd.cdw11, nvmeIoCtx->ptrData, 0);
         //command completed, so turn verbosity back to what it was
         nvmeIoCtx->device->deviceVerbosity = inVerbosity;
@@ -9980,16 +11006,15 @@ static int win10_Translate_Security_Send(nvmeCmdCtx *nvmeIoCtx)
     return ret;
 }
 
-static int win10_Translate_Security_Receive(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues win10_Translate_Security_Receive(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     //Windows API call does not exist...need to issue a SCSI IO and let the driver translate it for us...how silly
     if (M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 7, 0) == 0)//check that the nvme specific field isn't set since we can't issue that
     {
         //turn verbosity to silent since we don't need to see everything from issueing the scsi io...purpose right now is to make it look like an NVM io and be transparent to the caller.
         nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
-        //TODO: Should we add some of our own verbosity output here???
         ret = scsi_SecurityProtocol_In(nvmeIoCtx->device, M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 31, 24), M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 23, 8), false, nvmeIoCtx->cmd.adminCmd.cdw11, nvmeIoCtx->ptrData);
         //command completed, so turn verbosity back to what it was
         nvmeIoCtx->device->deviceVerbosity = inVerbosity;
@@ -9997,17 +11022,17 @@ static int win10_Translate_Security_Receive(nvmeCmdCtx *nvmeIoCtx)
     return ret;
 }
 
-static int win10_Translate_Set_Error_Recovery_Time_Limit(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues win10_Translate_Set_Error_Recovery_Time_Limit(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     bool dulbe = nvmeIoCtx->cmd.adminCmd.cdw11 & BIT16;
     uint16_t nvmTimeLimitedErrorRecovery = M_BytesTo2ByteValue(M_Byte1(nvmeIoCtx->cmd.adminCmd.cdw11), M_Byte0(nvmeIoCtx->cmd.adminCmd.cdw11));
     nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
     if (!dulbe && !(nvmeIoCtx->cmd.adminCmd.cdw11 >> 16))//make sure unsupported fields aren't set!!!
     {
         //use read-write error recovery MP - recovery time limit field
-        uint8_t *errorRecoveryMP = C_CAST(uint8_t*, calloc_aligned(MODE_HEADER_LENGTH10 + MP_READ_WRITE_ERROR_RECOVERY_LEN, sizeof(uint8_t), nvmeIoCtx->device->os_info.minimumAlignment));
+        uint8_t *errorRecoveryMP = C_CAST(uint8_t*, safe_calloc_aligned(MODE_HEADER_LENGTH10 + MP_READ_WRITE_ERROR_RECOVERY_LEN, sizeof(uint8_t), nvmeIoCtx->device->os_info.minimumAlignment));
         if (errorRecoveryMP)
         {
             //first, read the page into memory
@@ -10019,7 +11044,7 @@ static int win10_Translate_Set_Error_Recovery_Time_Limit(nvmeCmdCtx *nvmeIoCtx)
                 //send it back to the drive
                 ret = scsi_Mode_Select_10(nvmeIoCtx->device, MODE_HEADER_LENGTH10 + MP_READ_WRITE_ERROR_RECOVERY_LEN, true, false, false, errorRecoveryMP, MODE_HEADER_LENGTH10 + MP_READ_WRITE_ERROR_RECOVERY_LEN);
             }
-            safe_Free_aligned(errorRecoveryMP)
+            safe_free_aligned(&errorRecoveryMP);
         }
         else
         {
@@ -10030,16 +11055,16 @@ static int win10_Translate_Set_Error_Recovery_Time_Limit(nvmeCmdCtx *nvmeIoCtx)
     return ret;
 }
 
-static int win10_Translate_Set_Volatile_Write_Cache(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues win10_Translate_Set_Volatile_Write_Cache(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     bool wce = nvmeIoCtx->cmd.adminCmd.cdw11 & BIT0;
     nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
     if (!(nvmeIoCtx->cmd.adminCmd.cdw11 >> 31))//make sure unsupported fields aren't set!!!
     {
         //use caching MP - write back cache enabled field
-        uint8_t *cachingMP = C_CAST(uint8_t*, calloc_aligned(MODE_HEADER_LENGTH10 + MP_CACHING_LEN, sizeof(uint8_t), nvmeIoCtx->device->os_info.minimumAlignment));
+        uint8_t *cachingMP = C_CAST(uint8_t*, safe_calloc_aligned(MODE_HEADER_LENGTH10 + MP_CACHING_LEN, sizeof(uint8_t), nvmeIoCtx->device->os_info.minimumAlignment));
         if (cachingMP)
         {
             //first, read the page into memory
@@ -10060,7 +11085,7 @@ static int win10_Translate_Set_Volatile_Write_Cache(nvmeCmdCtx *nvmeIoCtx)
                 //send it back to the drive
                 ret = scsi_Mode_Select_10(nvmeIoCtx->device, MODE_HEADER_LENGTH10 + MP_CACHING_LEN, true, false, false, cachingMP, MODE_HEADER_LENGTH10 + MP_CACHING_LEN);
             }
-            safe_Free_aligned(cachingMP)
+            safe_free_aligned(&cachingMP);
         }
         else
         {
@@ -10071,20 +11096,15 @@ static int win10_Translate_Set_Volatile_Write_Cache(nvmeCmdCtx *nvmeIoCtx)
     return ret;
 }
 
-static int win10_Translate_Set_Power_Management(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues win10_Translate_Set_Power_Management(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
     uint8_t workloadHint = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw11, 7, 5);
     uint8_t powerState = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw11, 4, 0);
     if (workloadHint == 0 && M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw11, 31, 8) == 0)//cannot send workload hints in the API calls available, also filtering out reserved bits
     {
-        //start-stop unit command? Or maybe IOCTL_STORAGE_DEVICE_POWER_CAP
-        //I will use the IOCTL_STORAGE_DEVICE_POWER_CAP for this...-TJE
-
-        //we also need to return an error if the requested power state is not supported since the call we make may not be able to tell us that, or may round it to something close
-        //power states start at byte 2079 in the controller identify data...
         double maxPowerScalar = 0.01;
         if (nvmeIoCtx->device->drive_info.IdentifyData.nvme.ctrl.psd[powerState].flags & BIT0)
         {
@@ -10114,7 +11134,7 @@ static int win10_Translate_Set_Power_Management(nvmeCmdCtx *nvmeIoCtx)
                 &powerCap,
                 sizeof(STORAGE_DEVICE_POWER_CAP),
                 &returnedBytes,
-                NULL //TODO: add overlapped structure!
+                M_NULLPTR //Overlapped support???
             );
             stop_Timer(&commandTimer);
             nvmeIoCtx->device->os_info.last_error = GetLastError();
@@ -10122,7 +11142,6 @@ static int win10_Translate_Set_Power_Management(nvmeCmdCtx *nvmeIoCtx)
 
             if (success)
             {
-                //TODO: should we validate the returned data to make sure we got what value we requested? - TJE
                 ret = SUCCESS;
             }
             else
@@ -10140,16 +11159,17 @@ static int win10_Translate_Set_Power_Management(nvmeCmdCtx *nvmeIoCtx)
     return ret;
 }
 
-static int send_NVMe_Set_Temperature_Threshold(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues send_NVMe_Set_Temperature_Threshold(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
 
     uint8_t thsel = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw11, 21, 20);
     uint8_t tmpsel = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw11, 19, 16);
 
-    int32_t temperatureThreshold = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw11, 15, 0);
+    int32_t temperatureThreshold = C_CAST(int32_t, M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw11, 15, 0));
 
-    //TODO: check reserved fields are zero?
+    //TODO: check reserved fields are zero to return an error since they may communicate a different behavior we are not currently
+    //      supporting/implementing
     STORAGE_TEMPERATURE_THRESHOLD tempThresh;
     //STORAGE_TEMPERATURE_THRESHOLD_FLAG_ADAPTER_REQUEST
     memset(&tempThresh, 0, sizeof(STORAGE_TEMPERATURE_THRESHOLD));
@@ -10157,12 +11177,10 @@ static int send_NVMe_Set_Temperature_Threshold(nvmeCmdCtx *nvmeIoCtx)
     tempThresh.Version = sizeof(STORAGE_TEMPERATURE_THRESHOLD);
     tempThresh.Size = sizeof(STORAGE_TEMPERATURE_THRESHOLD);
 
-    //TODO: When do we set this flag?...for now just setting it all the time!
     tempThresh.Flags |= STORAGE_TEMPERATURE_THRESHOLD_FLAG_ADAPTER_REQUEST;
 
-
     tempThresh.Index = tmpsel;
-    tempThresh.Threshold = C_CAST(SHORT, temperatureThreshold - INT32_C(273));//NVMe does every temp in kelvin, but the API expects Celcius - TJE
+    tempThresh.Threshold = C_CAST(SHORT, temperatureThreshold - INT32_C(273));//NVMe does every temp in kelvin, but the API expects Celsius - TJE
     if (thsel == 0)
     {
         tempThresh.OverThreshold = TRUE;
@@ -10186,7 +11204,7 @@ static int send_NVMe_Set_Temperature_Threshold(nvmeCmdCtx *nvmeIoCtx)
         IOCTL_STORAGE_SET_TEMPERATURE_THRESHOLD,
         &tempThresh,
         sizeof(STORAGE_TEMPERATURE_THRESHOLD),
-        NULL,
+        M_NULLPTR,
         0,
         &bytesReturned,
         0
@@ -10196,7 +11214,6 @@ static int send_NVMe_Set_Temperature_Threshold(nvmeCmdCtx *nvmeIoCtx)
 
     if (success)
     {
-        //TODO: should we validate the returned data to make sure we got what value we requested? - TJE
         ret = SUCCESS;
         nvmeIoCtx->commandCompletionData.commandSpecific = 0;
         nvmeIoCtx->commandCompletionData.dw0Valid = true;
@@ -10218,12 +11235,12 @@ static int send_NVMe_Set_Temperature_Threshold(nvmeCmdCtx *nvmeIoCtx)
 }
 
 #if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_18362
-static int send_NVMe_Set_Features_Win10_Storage_Protocol(nvmeCmdCtx* nvmeIoCtx)
+static eReturnValues send_NVMe_Set_Features_Win10_Storage_Protocol(nvmeCmdCtx* nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    //TODO: If a feature is transferring data, need to take that into account!
-    uint32_t bufferLength = FIELD_OFFSET(STORAGE_PROPERTY_SET, AdditionalParameters) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA_EXT) + nvmeIoCtx->dataSize;
-    uint8_t* bufferData = C_CAST(uint8_t*, calloc(bufferLength, sizeof(uint8_t)));
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    uint32_t featTransferSize = (nvmeIoCtx->dataSize >= 4096) ? nvmeIoCtx->dataSize : 4096;//get features API requires a 4096 buffer, so allocating space for that in here too, in case this API is also expecting this data buffer size-TJE
+    uint32_t bufferLength = FIELD_OFFSET(STORAGE_PROPERTY_SET, AdditionalParameters) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA_EXT) + featTransferSize;
+    uint8_t* bufferData = C_CAST(uint8_t*, safe_calloc(bufferLength, sizeof(uint8_t)));
     if (bufferData)
     {
         PSTORAGE_PROPERTY_SET propSet = C_CAST(PSTORAGE_PROPERTY_SET, bufferData);
@@ -10257,13 +11274,14 @@ static int send_NVMe_Set_Features_Win10_Storage_Protocol(nvmeCmdCtx* nvmeIoCtx)
             //if this feature has a databuffer, set it up to transmit it.
             protocolSpecificData->ProtocolDataLength = nvmeIoCtx->dataSize;
             protocolSpecificData->ProtocolDataOffset = sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA_EXT);
-            memcpy_s(C_CAST(uint8_t*, protocolSpecificData) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA_EXT), nvmeIoCtx->dataSize, nvmeIoCtx->ptrData, nvmeIoCtx->dataSize);//TODO: Handle error code? we shouldn't ever have one since sizes are the same
+            memcpy_s(C_CAST(uint8_t*, protocolSpecificData) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA_EXT), nvmeIoCtx->dataSize, nvmeIoCtx->ptrData, nvmeIoCtx->dataSize);
         }
         else
         {
             //no additional command data is being shared for this feature.
-            protocolSpecificData->ProtocolDataLength = 0;
-            protocolSpecificData->ProtocolDataOffset = 0;
+            //Due to get features requiring a 4096 sized buffer, we are passing one in here too just to make Windows happy even if the feature does no t use it.
+            protocolSpecificData->ProtocolDataLength = featTransferSize;
+            protocolSpecificData->ProtocolDataOffset = sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA_EXT);
         }
 
         //
@@ -10283,7 +11301,7 @@ static int send_NVMe_Set_Features_Win10_Storage_Protocol(nvmeCmdCtx* nvmeIoCtx)
             bufferData,
             bufferLength,
             &returnedLength,
-            NULL
+            M_NULLPTR
         );
         start_Timer(&commandTimer);
         nvmeIoCtx->device->os_info.last_error = GetLastError();
@@ -10324,7 +11342,7 @@ static int send_NVMe_Set_Features_Win10_Storage_Protocol(nvmeCmdCtx* nvmeIoCtx)
             nvmeIoCtx->commandCompletionData.commandSpecific = protocolSpecificData->FixedProtocolReturnData;//This should only be DWORD 0 on a get features command anyways...
             nvmeIoCtx->commandCompletionData.dw0Valid = true;
         }
-        safe_Free(bufferData)
+        safe_free(&bufferData);
     }
     else
     {
@@ -10334,9 +11352,9 @@ static int send_NVMe_Set_Features_Win10_Storage_Protocol(nvmeCmdCtx* nvmeIoCtx)
 }
 #endif
 
-static int send_NVMe_Set_Features_Win10(nvmeCmdCtx *nvmeIoCtx, bool *useNVMPassthrough)
+static eReturnValues send_NVMe_Set_Features_Win10(nvmeCmdCtx *nvmeIoCtx, bool *useNVMPassthrough)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
 
 #if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_18362
     //1903 added storage_set_property IOCTL support, so try it first before falling back on these other methods - TJE
@@ -10345,9 +11363,9 @@ static int send_NVMe_Set_Features_Win10(nvmeCmdCtx *nvmeIoCtx, bool *useNVMPasst
         ret = send_NVMe_Set_Features_Win10_Storage_Protocol(nvmeIoCtx);
     }
 #endif
-    if(ret == OS_COMMAND_NOT_AVAILABLE)
+    if (ret == OS_COMMAND_NOT_AVAILABLE || ret == OS_PASSTHROUGH_FAILURE)
     {
-        //TODO: Depending on the feature, we may need a SCSI translation, a Windows API call, or we won't be able to perform any translation at all.
+        //Depending on the feature, we may need a SCSI translation, a Windows API call, or we won't be able to perform any translation at all.
         //IOCTL_STORAGE_DEVICE_POWER_CAP
         //bool save = nvmeIoCtx->cmd.nvmCmd.cdw10 & BIT31;
         uint8_t featureID = M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw10);
@@ -10407,10 +11425,275 @@ static int send_NVMe_Set_Features_Win10(nvmeCmdCtx *nvmeIoCtx, bool *useNVMPasst
     return ret;
 }
 
-static int win10_Translate_Format(nvmeCmdCtx *nvmeIoCtx)
+#if defined (USE_IOCTL_REINIT_MEDIA)
+
+#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
+//This IOCTL started in Windows 10, 1607. AKA 14393 API. It only supported NVM format with crypto erase though.
+//When Windows 11 was released, this API added a structure to specify a sanitize command to run, but is limited to block and crypto erase only.
+// This Windows 11/10 API change was 20348 and supposedly also supports Windows 10 21H1
+//Win11:
+//  Issuing this IOCTL with no parameters on a drive that supports crypto erase will issue sanitize crypto erase with the ause bit set to 1
+//  Issuing this IOCTL with no parameters on a drive that supports block erase will return an error (1) for "incorrect function"
+//  Assumed that old drive without sanitize crypto will run the format with crypto erase as this IOCTL originally would do.
+//Win10:
+//  This will change depending on the version of Windows 10 that is running. 1607 - 1809(?) will do format NVM. Microsoft docs state 1903 and later support sanitize, but it is not clear exactly where the ending cutoff is.
+//  Starting with 21H1, it is assumed that the behavior matches Windows 11 behavior. NOTE: Need to figure out if we have a way to test specific versions to figure out the exact cut off. -TJE
+//  Assumed that old drive without sanitize crypto will run the format with crypto erase as this IOCTL originally would do.
+//Because of all the various changes in behavior, the function below has to assess the incoming command and the drive's santize capabilities to decide what it will do.
+typedef enum _eNVM_ReInit_Compatible
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+    NVM_REINIT_INCOMPATIBLE_CMD,
+    NVM_REINIT_INCOMPATIBLE_FORMAT,
+    NVM_REINIT_INCOMPATIBLE_SANITIZE_OLD_API_OR_OS,//compiled with API before 20348 or old version of Windows 10 that doesn't support sanitize.
+    NVM_REINIT_INCOMPATIBLE_SANITIZE_OPTIONS,//a bit or option specified in sanitize is not compatible/able to be specified in this IOCTL
+    NVM_REINIT_INCOMPATIBLE_SANITIZE_OVERWRITE,//overwrite is not allowed in this API
+    NVM_REINIT_COMPATIBLE_FORMAT_CRYPTO,
+    NVM_REINIT_COMPATIBLE_SANITIZE_CRYPTO,
+    NVM_REINIT_COMPATIBLE_SANITIZE_BLOCK
+}eNVM_ReInit_Compatible;
+
+static eNVM_ReInit_Compatible is_NVMe_Cmd_Compatible_With_Reinitialize_Media_IOCTL(nvmeCmdCtx* nvmeIoCtx)
+{
+    eNVM_ReInit_Compatible compat = NVM_REINIT_INCOMPATIBLE_CMD;
+    if (is_Windows_10_Version_1607_Or_Higher())
+    {
+        //check a couple basic requirements....valid pointer and an admin command
+        if (nvmeIoCtx && nvmeIoCtx->commandType == NVM_ADMIN_CMD)
+        {
+            //first check for format crypto erase.
+            if (nvmeIoCtx->cmd.adminCmd.opcode == NVME_ADMIN_CMD_FORMAT_NVM)
+            {
+                compat = NVM_REINIT_INCOMPATIBLE_FORMAT;
+                if (is_Windows_10_Version_1903_Or_Higher() && nvmeIoCtx->device->drive_info.IdentifyData.nvme.ctrl.sanicap & BIT0)
+                {
+                    //TODO: Figure out exactly when this IOCTL switches to sanitize from format with crypto erase. MSDN documentatino does not specify earlier than 1903.-TJE
+                    //Starting with at least 1903, possibly earlier, this IOCTL will issue sanitize crypto erase instead.
+                    //because this is not necessarily a malformed command, but a completeley different than expected behavior,
+                    //returning this instead.
+                    return NVM_REINIT_INCOMPATIBLE_CMD;
+                }
+                else
+                {
+                    //next we need to screen other fields to make sure there aren't other things being asked while running the format.
+                    if (M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 11, 9) == 2)
+                    {
+                        //crypto erase.
+                        //Finish validating other parameters.
+                        //cannot change PI, metadata, or LBA format.
+                        uint32_t reservedBitsDWord10 = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 31, 12);
+                        bool pil = nvmeIoCtx->cmd.adminCmd.cdw10 & BIT8;
+                        uint8_t pi = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 7, 5);
+                        bool mset = nvmeIoCtx->cmd.adminCmd.cdw10 & BIT4;
+                        uint8_t lbaFormat = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 3, 0);
+                        nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
+                        if (reservedBitsDWord10 == 0 && !pil && !mset && pi == 0)
+                        {
+                            //now make sure LBA size matches current settings
+                            int16_t powerOfTwo = C_CAST(int16_t, nvmeIoCtx->device->drive_info.IdentifyData.nvme.ns.lbaf[lbaFormat].lbaDS);
+                            uint32_t lbaSize = 1;
+                            while (powerOfTwo > 0)
+                            {
+                                lbaSize = lbaSize << UINT32_C(1);//multiply by 2
+                                --powerOfTwo;
+                            }
+                            if (lbaSize == nvmeIoCtx->device->drive_info.deviceBlockSize)
+                            {
+                                compat = NVM_REINIT_COMPATIBLE_FORMAT_CRYPTO;
+                            }
+                        }
+                    }
+                }
+            }
+            else if (nvmeIoCtx->cmd.adminCmd.opcode == NVME_ADMIN_CMD_SANITIZE)
+            {
+                compat = NVM_REINIT_INCOMPATIBLE_SANITIZE_OLD_API_OR_OS;
+                if (is_Windows_10_Version_21H1_Or_Higher())
+                {
+                    compat = NVM_REINIT_INCOMPATIBLE_SANITIZE_OPTIONS;
+                    //cannot currently specify "no deallocate after sanitize", so if this is set, return incompatible options
+                    if (nvmeIoCtx->cmd.adminCmd.cdw10 & BIT9)
+                    {
+                        return compat;
+                    }
+                    if (is_Windows_10_Version_1903_Or_Higher() && nvmeIoCtx->cmd.adminCmd.cdw10 & BIT3)
+                    {
+                        //microsoft is PROBABLY setting the AUSE bit since that is default behavior in newer versions, so screen for that since this version is too old to take parameters
+                        return compat;
+                    }
+                    //ignore the following since they only apply to overwrite which isn't supported anyways
+                    //ignore "overwrite invert pattern between passes"
+                    //ignore "overwrite pass count"
+                    //ignore "overwrite pattern"
+
+                    //If we are here and this is a supported OS and API, check for a valid Sanitize operation.
+                    switch (M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 2, 0))
+                    {
+                    case SANITIZE_NVM_EXIT_FAILURE_MODE:
+                    case SANITIZE_NVM_OVERWRITE:
+                        compat = NVM_REINIT_INCOMPATIBLE_SANITIZE_OVERWRITE;
+                        break;
+                    case SANITIZE_NVM_BLOCK_ERASE:
+                        if (is_Windows_10_Version_21H1_Or_Higher())
+                        {
+                            //can only specify sanitize block erase starting Windows 10 21H1 or higher with this IOCTL
+                            compat = NVM_REINIT_COMPATIBLE_SANITIZE_BLOCK;
+                        }
+                        break;
+                    case SANITIZE_NVM_CRYPTO:
+                        //1909 and higher will likely allow sanitize crypto if all the bits are set as expected, whether the ioctl is given parameters or not.
+                        //21h1 definitely will, but between 1909 and 21h1 no parameters are accepted, so it is not clear what the behavior is.
+                        compat = NVM_REINIT_COMPATIBLE_SANITIZE_CRYPTO;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return compat;
+}
+
+static eReturnValues nvme_Ioctl_Storage_Reinitialize_Media(nvmeCmdCtx* nvmeIoCtx)
+{
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    memset(&nvmeIoCtx->commandCompletionData, 0, sizeof(completionQueueEntry));
+    if (is_Windows_10_Version_1607_Or_Higher())
+    {
+        //Now make sure we have either format with crypto erase or sanitize block erase or sanitize crypto erase.
+        eNVM_ReInit_Compatible compatIO = is_NVMe_Cmd_Compatible_With_Reinitialize_Media_IOCTL(nvmeIoCtx);
+#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_20348
+        if (is_Windows_10_Version_21H1_Or_Higher() && (compatIO == NVM_REINIT_COMPATIBLE_SANITIZE_CRYPTO || compatIO == NVM_REINIT_COMPATIBLE_SANITIZE_BLOCK))
+        {
+            //Setup parameters to issue Sanitize block or crypto erase!
+            STORAGE_REINITIALIZE_MEDIA reinitMedia;
+            memset(&reinitMedia, 0, sizeof(STORAGE_REINITIALIZE_MEDIA));
+            reinitMedia.Version = sizeof(STORAGE_REINITIALIZE_MEDIA);
+            reinitMedia.Size = sizeof(STORAGE_REINITIALIZE_MEDIA);
+            reinitMedia.TimeoutInSeconds = nvmeIoCtx->timeout;
+            switch (M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 2, 0))
+            {
+            case SANITIZE_NVM_EXIT_FAILURE_MODE:
+            case SANITIZE_NVM_OVERWRITE:
+                return BAD_PARAMETER;
+            case SANITIZE_NVM_BLOCK_ERASE:
+                reinitMedia.SanitizeOption.SanitizeMethod = StorageSanitizeMethodBlockErase;
+                break;
+            case SANITIZE_NVM_CRYPTO:
+                reinitMedia.SanitizeOption.SanitizeMethod = StorageSanitizeMethodCryptoErase;
+                break;
+            }
+            if (nvmeIoCtx->cmd.adminCmd.cdw10 & BIT3)
+            {
+                reinitMedia.SanitizeOption.DisallowUnrestrictedSanitizeExit = false;
+            }
+            else
+            {
+                reinitMedia.SanitizeOption.DisallowUnrestrictedSanitizeExit = true;
+            }
+            seatimer_t commandTimer;
+            memset(&commandTimer, 0, sizeof(seatimer_t));
+            start_Timer(&commandTimer);
+            DWORD returnedLength = 0;
+            if (nvmeIoCtx->device->deviceVerbosity >= VERBOSITY_COMMAND_VERBOSE)
+            {
+                printf("Sending IOCTL_STORAGE_REINITIALIZE_MEDIA for Sanitize ");
+                switch (reinitMedia.SanitizeOption.SanitizeMethod)
+                {
+                case StorageSanitizeMethodDefault:
+                    printf("Default method\n");
+                    break;
+                case StorageSanitizeMethodBlockErase:
+                    printf("Block Erase method\n");
+                    break;
+                case StorageSanitizeMethodCryptoErase:
+                    printf("Crypto Erase method\n");
+                    break;
+                }
+            }
+            BOOL result = DeviceIoControl(nvmeIoCtx->device->os_info.fd,
+                IOCTL_STORAGE_REINITIALIZE_MEDIA,
+                &reinitMedia,
+                sizeof(STORAGE_REINITIALIZE_MEDIA),
+                M_NULLPTR,
+                0,
+                &returnedLength,
+                M_NULLPTR
+            );
+            stop_Timer(&commandTimer);
+            nvmeIoCtx->device->os_info.last_error = GetLastError();
+            nvmeIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
+            if (!result)
+            {
+                if (nvmeIoCtx->device->deviceVerbosity >= VERBOSITY_COMMAND_VERBOSE)
+                {
+                    printf("Windows Error: ");
+                    print_Windows_Error_To_Screen(nvmeIoCtx->device->os_info.last_error);
+                }
+                ret = OS_PASSTHROUGH_FAILURE;
+            }
+            else
+            {
+                ret = SUCCESS;
+            }
+        }
+        else
+#endif //(WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_20348
+            if (compatIO == NVM_REINIT_COMPATIBLE_FORMAT_CRYPTO || compatIO == NVM_REINIT_COMPATIBLE_SANITIZE_CRYPTO)
+            {
+                //Issue without the parameters for Format with crypto erase only! (in 1607)
+                //At some point this switched to sanitize crypto when the drive supports it, but it is not clear when.
+                //The compatibility checking code assumes this happened in 1903, but it is not clear exactly when that happened.
+                //So if we get to this case and one of the two crypto copatible erases is specified, this will issue the command.
+                //If we ever get more info to further refine the compatibility checks, we should do that!
+                seatimer_t commandTimer;
+                memset(&commandTimer, 0, sizeof(seatimer_t));
+                start_Timer(&commandTimer);
+                DWORD returnedLength = 0;
+                if (nvmeIoCtx->device->deviceVerbosity >= VERBOSITY_COMMAND_VERBOSE)
+                {
+                    printf("Sending IOCTL_STORAGE_REINITIALIZE_MEDIA for Format/Sanitize Crypto\n");
+                }
+                BOOL result = DeviceIoControl(nvmeIoCtx->device->os_info.fd,
+                    IOCTL_STORAGE_REINITIALIZE_MEDIA,
+                    M_NULLPTR,
+                    0,
+                    M_NULLPTR,
+                    0,
+                    &returnedLength,
+                    M_NULLPTR
+                );
+                stop_Timer(&commandTimer);
+                nvmeIoCtx->device->os_info.last_error = GetLastError();
+                nvmeIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
+                if (!result)
+                {
+                    if (nvmeIoCtx->device->deviceVerbosity >= VERBOSITY_COMMAND_VERBOSE)
+                    {
+                        printf("Windows Error: ");
+                        print_Windows_Error_To_Screen(nvmeIoCtx->device->os_info.last_error);
+                    }
+                    ret = OS_PASSTHROUGH_FAILURE;
+                }
+                else
+                {
+                    ret = SUCCESS;
+                }
+            }
+    }
+    return ret;
+}
+#endif //WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
+
+#endif //USE_IOCTL_REINIT_MEDIA
+
+#if defined (ENABLE_TRANSLATE_FORMAT)
+//This code is currently disabled due to the format unit translation not actually working.
+//Also, microsoft updated some online documentation to show this and it clarified that the sanitize CDB issues the sanitize command.
+//It is possible that some earlier version of Windows 10 supported format translation or handled sanitize differently, but that
+//information is not available.
+static eReturnValues win10_Translate_Format(nvmeCmdCtx *nvmeIoCtx)
+{
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     uint32_t reservedBitsDWord10 = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 31, 12);
     uint8_t secureEraseSettings = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 11, 9);
     bool pil = nvmeIoCtx->cmd.adminCmd.cdw10 & BIT8;
@@ -10418,98 +11701,127 @@ static int win10_Translate_Format(nvmeCmdCtx *nvmeIoCtx)
     bool mset = nvmeIoCtx->cmd.adminCmd.cdw10 & BIT4;
     uint8_t lbaFormat = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 3, 0);
     nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
-    if (reservedBitsDWord10 == 0 && secureEraseSettings == 0 && !pil && mset)//we dont want to miss parameters that are currently reserved and we cannot do a secure erase with this translation
+    if (reservedBitsDWord10 == 0 && !pil && !mset && pi == 0)
     {
-        //mode select with mode descriptor (if needed for block size changes)
-        //First we need to map the incoming LBA format to a size in bytes to send in a mode select
+        //bool issueFormatCMD = false; //While this says this command is translated, I have yet to figure out which combo makes it work.
+        // I get invalid opcode every time I try issuing format unit. https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/stornvme-scsi-translation-support
         int16_t powerOfTwo = C_CAST(int16_t, nvmeIoCtx->device->drive_info.IdentifyData.nvme.ns.lbaf[lbaFormat].lbaDS);
         uint32_t lbaSize = 1;
-        while (powerOfTwo >= 0)
+        while (powerOfTwo > 0)
         {
             lbaSize = lbaSize << UINT32_C(1);//multiply by 2
             --powerOfTwo;
         }
-        if (lbaSize >= LEGACY_DRIVE_SEC_SIZE && lbaSize != nvmeIoCtx->device->drive_info.deviceBlockSize)//make sure the value is greater than 512 as required by spec and that it is different than what it is already set as! - TJE
+        if (lbaSize != nvmeIoCtx->device->drive_info.deviceBlockSize)
         {
-            //send a mode select command with a data block descriptor set to the new size
-            //but first read the control mode page with a block descriptor
-            uint8_t controlPageAndBD[36] = { 0 };
-            if (SUCCESS == scsi_Mode_Sense_10(nvmeIoCtx->device, MP_CONTROL, 36, 0, false, true, MPC_CURRENT_VALUES, controlPageAndBD))
+            //This is NOT supported from what I can tell.
+            //The only mode page supported by Windows is the caching mode page. with size set to 0x0A for a total of 12B of data
+            // block descriptors are never returned.
+            // only mode sense 10 works. LongLBA does NOT work.
+            // No matter which combo of bits/fields used for mode select, it is always rejected with invalid field in CDB.
+            return OS_COMMAND_NOT_AVAILABLE;
+        }
+        else
+        {
+            //NO LBA size change.
+            //In this case we MIGHT be able to run a secure erase using the non-standard sanitize block erase or crypto erase translation
+            //MSFT mentions this briefly in their documentation here:  https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/stornvme-command-set-support
+            if (secureEraseSettings != 0)
             {
-                //got the block descriptor...so lets modify it as we need to...then send it back to the drive(r)
-                //set number of logical blocks to all F's to make this as big as possible...
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 0] = 0xFF;
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 1] = 0xFF;
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 2] = 0xFF;
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 3] = 0xFF;
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 4] = 0xFF;
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 5] = 0xFF;
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 6] = 0xFF;
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 7] = 0xFF;
-                //set the block size
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 12] = M_Byte3(lbaSize);
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 13] = M_Byte2(lbaSize);
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 14] = M_Byte1(lbaSize);
-                controlPageAndBD[MODE_HEADER_LENGTH10 + 15] = M_Byte0(lbaSize);
-                //Leave everything else alone! Just send it to the drive now :)
-                if (SUCCESS != scsi_Mode_Select_10(nvmeIoCtx->device, 36, true, true, false, controlPageAndBD, 36))
+                //issueFormatCMD = false;
+                //translated with sanitize
+                // NOTE: If you use sanitize block erase CDB, this translates to sanitize block erase NVM
+                //       If you use sanitize crypto erase CDB, it translates to format + crypto erase from what I can tell.
+                //       This is not documented, but found through trial and error testing and debugging.
+                //       I've commented out the sanitize block erase since this does not issue the expected command.
+                //if (secureEraseSettings == 1)
+                //{
+                //    //block
+                //    ret = scsi_Sanitize_Block_Erase(nvmeIoCtx->device, false, false, false);
+                //}
+                //else 
+                if (secureEraseSettings == 2)
                 {
-                    return OS_COMMAND_NOT_AVAILABLE;
+#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
+                    //crypto
+                    //NOTE: the IOCTL_STORAGE_REINITIALIZE_MEDIA can be used for this too IF no buffer length is passed in win 10 1607.
+                    //      By 1903, this IOCTL instead issues sanitize crypto erase instead from what I can tell from trial and error testing
+                    //      and the limited documentation available.
+                    //      It is unknown when this CDB translation became available, but will choose which command to issue depending on the fields and OS
+                    //      version as best we can.
+                    if (NVM_REINIT_COMPATIBLE_FORMAT_CRYPTO == is_NVMe_Cmd_Compatible_With_Reinitialize_Media_IOCTL(nvmeIoCtx))
+                    {
+                        ret = nvme_Ioctl_Storage_Reinitialize_Media(nvmeIoCtx);
+                    }
+                    else
+#endif //#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
+                    {
+                        ret = scsi_Sanitize_Cryptographic_Erase(nvmeIoCtx->device, false, false, false);
+                    }
+                }
+                else
+                {
+                    ret = OS_COMMAND_NOT_AVAILABLE;
                 }
             }
             else
             {
-                return OS_COMMAND_NOT_AVAILABLE;
+                //I've tried the format unit command without parameters and no luck. I have tried with fmtdata and no luck.
+                ret = OS_COMMAND_NOT_AVAILABLE;
             }
         }
-        //format unit command
-        //set up parameter data if necessary and send the scsi format unit command to be translated and sent to the drive. The mode sense/select should have been cached to be used by the format command.
-        //if (pi == 0)
+        //if (issueFormatCMD)
         //{
-        //    //send without parameter data
-        //    ret = scsi_Format_Unit(nvmeIoCtx->device, 0, false, false, false, 0, 0, NULL, 0, 0, 60);
-        //}
-        //else
-        //{
-        //send with parameter data
-        uint8_t formatParameterData[4] = { 0 };//short header
-        uint8_t fmtpInfo = 0;
-        uint8_t piUsage = 0;
-        switch (pi)
-        {
-        case 0:
-            break;
-        case 1:
-            fmtpInfo = 0x2;
-            break;
-        case 2:
-            fmtpInfo = 0x3;
-            break;
-        case 3:
-            fmtpInfo = 0x3;
-            piUsage = 1;
-            break;
-        default:
-            return OS_COMMAND_NOT_AVAILABLE;
-        }
-        formatParameterData[0] = M_GETBITRANGE(piUsage, 2, 0);
-        ret = scsi_Format_Unit(nvmeIoCtx->device, fmtpInfo, false, true, false, 0, 0, formatParameterData, 4, 0, 60);
+        //    //format unit command
+        //    //set up parameter data if necessary and send the scsi format unit command to be translated and sent to the drive. The mode sense/select should have been cached to be used by the format command.
+        //    //if (pi == 0)
+        //    //{
+        //    //    //send without parameter data
+        //    //    ret = scsi_Format_Unit(nvmeIoCtx->device, 0, false, false, false, 0, 0, M_NULLPTR, 0, 0, 60);
+        //    //}
+        //    //else
+        //    //{
+        //    //send with parameter data
+        //    //DECLARE_ZERO_INIT_ARRAY(uint8_t, formatParameterData, 4);//short header
+        //    //uint8_t fmtpInfo = 0;
+        //    //uint8_t piUsage = 0;
+        //    //switch (pi)
+        //    //{
+        //    //case 0:
+        //    //    break;
+        //    //case 1:
+        //    //    fmtpInfo = 0x2;
+        //    //    break;
+        //    //case 2:
+        //    //    fmtpInfo = 0x3;
+        //    //    break;
+        //    //case 3:
+        //    //    fmtpInfo = 0x3;
+        //    //    piUsage = 1;
+        //    //    break;
+        //    //default:
+        //    //    return OS_COMMAND_NOT_AVAILABLE;
+        //    //}
+        //    //formatParameterData[0] = M_GETBITRANGE(piUsage, 2, 0);
+        //    ret = scsi_Format_Unit(nvmeIoCtx->device, 0, false, false, false, 0, 0, M_NULLPTR, 0, 0, 60);
+        //    //}
         //}
     }
     nvmeIoCtx->device->deviceVerbosity = inVerbosity;
     return ret;
 }
+#endif //ENABLE_TRANSLATE_FORMAT
 
-static int win10_Translate_Write_Uncorrectable(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues win10_Translate_Write_Uncorrectable(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     uint64_t totalCommandTime = 0;
     nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
     uint64_t lba = M_BytesTo8ByteValue(M_Byte3(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte2(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte1(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte3(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte2(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte1(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw10));
     for (uint16_t iter = 0; iter < (M_Word0(nvmeIoCtx->cmd.nvmCmd.cdw12) + 1); ++iter)//+1 because nvme uses a zero based range value
     {
-        int individualCommandRet = scsi_Write_Long_16(nvmeIoCtx->device, true, false, false, lba + iter, 0, NULL);
+        eReturnValues individualCommandRet = scsi_Write_Long_16(nvmeIoCtx->device, true, false, false, lba + iter, 0, M_NULLPTR);
         if (individualCommandRet != SUCCESS)
         {
             //This is making sure we don't have a bad command followed by a good command, then missing a bad status code
@@ -10522,24 +11834,21 @@ static int win10_Translate_Write_Uncorrectable(nvmeCmdCtx *nvmeIoCtx)
     return ret;
 }
 
-static int win10_Translate_Flush(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues win10_Translate_Flush(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
-    //TODO: should we do this or should we send a SCSI Synchronize Cache command to be translated?
-    //ret = os_Flush(nvmeIoCtx->device);
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
-    //ret = scsi_Synchronize_Cache_16(nvmeIoCtx->device, false, 0, 0, 0);//NOTE: Switched to synchronize cache 10 due to documentation from MSFT only specifying the 10byte CDB opcode - TJE
+    //NOTE: Switched to synchronize cache 10 due to documentation from MSFT only specifying the 10byte CDB opcode - TJE
     ret = scsi_Synchronize_Cache_10(nvmeIoCtx->device, false, 0, 0, 0);
     nvmeIoCtx->device->deviceVerbosity = inVerbosity;
     return ret;
 }
 
-static int win10_Translate_Read(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues win10_Translate_Read(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
-    //TODO: We need to validate other fields to make sure we make the right call...may need a SCSI read command or a simple os_Read
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     //extract fields from NVMe context, then see if we can put them into a compatible SCSI command
     uint64_t startingLBA = M_BytesTo8ByteValue(M_Byte3(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte2(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte1(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte3(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte2(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte1(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw10));
     bool limitedRetry = nvmeIoCtx->cmd.nvmCmd.cdw12 & BIT31;
@@ -10591,7 +11900,6 @@ static int win10_Translate_Read(nvmeCmdCtx *nvmeIoCtx)
     {
         //NOTE: Spec only mentions translations for read 10, 12, 16...but we may also need 32!
         //Even though it isn't in the spec, we'll attempt it anyways when we have certain fields set... - TJE
-        //TODO: we should check if the drive was formatted with protection information to make a better call on what to do...-TJE
         if (expectedLogicalBlockAccessTag != 0 || expectedLogicalBlockApplicationTag != 0 || expectedLogicalBlockTagMask != 0)
         {
             //read 32 command
@@ -10607,11 +11915,10 @@ static int win10_Translate_Read(nvmeCmdCtx *nvmeIoCtx)
     return ret;
 }
 
-static int win10_Translate_Write(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues win10_Translate_Write(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
-    //TODO: We need to validate other fields to make sure we make the right call...may need a SCSI write command or a simple os_Write
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
     //extract fields from NVMe context, then see if we can put them into a compatible SCSI command
     uint64_t startingLBA = M_BytesTo8ByteValue(M_Byte3(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte2(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte1(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte3(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte2(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte1(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw10));
     bool limitedRetry = nvmeIoCtx->cmd.nvmCmd.cdw12 & BIT31;
@@ -10665,7 +11972,6 @@ static int win10_Translate_Write(nvmeCmdCtx *nvmeIoCtx)
     {
         //NOTE: Spec only mentions translations for write 10, 12, 16...but we may also need 32!
         //Even though it isn't in the spec, we'll attempt it anyways when we have certain fields set... - TJE
-        //TODO: we should check if the drive was formatted with protection information to make a better call on what to do...-TJE
         if (initialLogicalBlockAccessTag != 0 || logicalBlockTagMask != 0 || logicalBlockApplicationTag != 0)
         {
             //write 32 command
@@ -10682,11 +11988,10 @@ static int win10_Translate_Write(nvmeCmdCtx *nvmeIoCtx)
 }
 
 //MSFT documentation does not show this translation as available. Code left here in case someone wants to test it in the future.
-//static int win10_Translate_Compare(nvmeCmdCtx *nvmeIoCtx)
+//static eReturnValues win10_Translate_Compare(nvmeCmdCtx *nvmeIoCtx)
 //{
-//    int ret = OS_COMMAND_NOT_AVAILABLE;
-//    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
-//    //TODO: We need to validate other fields to make sure we make the right call...may need a SCSI verify command or a simple os_Verify
+//    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+//    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
 //    //extract fields from NVMe context, then see if we can put them into a compatible SCSI command
 //    uint64_t startingLBA = M_BytesTo8ByteValue(M_Byte3(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte2(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte1(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw11), M_Byte3(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte2(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte1(nvmeIoCtx->cmd.nvmCmd.cdw10), M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw10));
 //    bool limitedRetry = nvmeIoCtx->cmd.nvmCmd.cdw12 & BIT31;
@@ -10728,7 +12033,6 @@ static int win10_Translate_Write(nvmeCmdCtx *nvmeIoCtx)
 //    {
 //        //NOTE: Spec only mentions translations for verify 10, 12, 16...but we may also need 32!
 //        //Even though it isn't in the spec, we'll attempt it anyways when we have certain fields set... - TJE
-//        //TODO: we should check if the drive was formatted with protection information to make a better call on what to do...-TJE
 //        if (expectedLogicalBlockAccessTag != 0 || expectedLogicalBlockApplicationTag != 0 || expectedLogicalBlockTagMask != 0)
 //        {
 //            //verify 32 command
@@ -10744,14 +12048,14 @@ static int win10_Translate_Write(nvmeCmdCtx *nvmeIoCtx)
 //    return ret;
 //}
 
-static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
+//uncomment this to enable returning a not supported value when a context attribute is set
+//#define WIN_NVME_DEALLOCATE_CONTEXT_FAILURE
+
+static eReturnValues win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
-    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
-    //TODO: We need to validate other fields to make sure we make the right call...may need a SCSI unmap command or
-    //FSCTL_FILE_LEVEL_TRIM (and maybe also FSCTL_ALLOW_EXTENDED_DASD_IO)
-    //NOTE: Using SCSI Unmap command - TJE
-    uint8_t numberOfRanges = M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw10) + 1;//this is zero based in NVMe!
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+    uint16_t numberOfRanges = M_Byte0(nvmeIoCtx->cmd.nvmCmd.cdw10) + UINT16_C(1);//this is zero based in NVMe!
     bool deallocate = nvmeIoCtx->cmd.nvmCmd.cdw11 & BIT2;//This MUST be set to 1
     bool integralDatasetForWrite = nvmeIoCtx->cmd.nvmCmd.cdw11 & BIT1;//cannot be supported
     bool integralDatasetForRead = nvmeIoCtx->cmd.nvmCmd.cdw11 & BIT0;//cannot be supported
@@ -10761,24 +12065,31 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
         //Each range specified will be translated to a SCSI unmap descriptor.
         //NOTE: All context attributes will be ignored since it cannot be translated. It is also optional and the controller may not do anything with it.
         //We can optionally check for this, but I do not think it's really worth it right now. I will have code in place for this, just commented out - TJE
+#if defined (WIN_NVME_DEALLOCATE_CONTEXT_FAILURE)
         bool atLeastOneContextAttributeSet = false;
+#endif //WIN_NVME_DEALLOCATE_CONTEXT_FAILURE
         //first, allocate enough memory for the Unmap command
-        uint32_t unmapDataLength = 8 + (16 * numberOfRanges);
-        uint8_t *unmapParameterData = C_CAST(uint8_t*, calloc_aligned(unmapDataLength, sizeof(uint8_t), nvmeIoCtx->device->os_info.minimumAlignment));//each range is 16 bytes plus an 8 byte header
+        uint16_t unmapParameterDataLength = UINT16_C(8) + (UINT16_C(16) * numberOfRanges);
+        uint8_t *unmapParameterData = C_CAST(uint8_t*, safe_calloc_aligned(unmapParameterDataLength, sizeof(uint8_t), nvmeIoCtx->device->os_info.minimumAlignment));//each range is 16 bytes plus an 8 byte header
         if (unmapParameterData)
         {
             //in a loop, set the unmap descriptors
-            uint32_t scsiOffset = 8, nvmOffset = 0;
-            for (uint16_t rangeIter = 0; rangeIter < numberOfRanges && scsiOffset < unmapDataLength && nvmOffset < nvmeIoCtx->dataSize; ++rangeIter, scsiOffset += 16, nvmOffset += 16)
+            uint32_t scsiOffset = 8;
+            uint32_t nvmOffset = 0;
+            for (uint16_t rangeIter = 0; rangeIter < numberOfRanges && scsiOffset < unmapParameterDataLength && nvmOffset < nvmeIoCtx->dataSize; ++rangeIter, scsiOffset += 16, nvmOffset += 16)
             {
                 //get the info we need from the incomming buffer
+#if defined (WIN_NVME_DEALLOCATE_CONTEXT_FAILURE)
                 uint32_t nvmContextAttributes = M_BytesTo4ByteValue(nvmeIoCtx->ptrData[nvmOffset + 3], nvmeIoCtx->ptrData[nvmOffset + 2], nvmeIoCtx->ptrData[nvmOffset + 1], nvmeIoCtx->ptrData[nvmOffset + 0]);
+#endif //WIN_NVME_DEALLOCATE_CONTEXT_FAILURE
                 uint32_t nvmLengthInLBAs = M_BytesTo4ByteValue(nvmeIoCtx->ptrData[nvmOffset + 7], nvmeIoCtx->ptrData[nvmOffset + 6], nvmeIoCtx->ptrData[nvmOffset + 5], nvmeIoCtx->ptrData[nvmOffset + 4]);
-                uint32_t nvmStartingLBA = M_BytesTo4ByteValue(nvmeIoCtx->ptrData[nvmOffset + 15], nvmeIoCtx->ptrData[nvmOffset + 14], nvmeIoCtx->ptrData[nvmOffset + 13], nvmeIoCtx->ptrData[nvmOffset + 12]);
+                uint64_t nvmStartingLBA = M_BytesTo8ByteValue(nvmeIoCtx->ptrData[nvmOffset + 15], nvmeIoCtx->ptrData[nvmOffset + 14], nvmeIoCtx->ptrData[nvmOffset + 13], nvmeIoCtx->ptrData[nvmOffset + 12], nvmeIoCtx->ptrData[nvmOffset + 11], nvmeIoCtx->ptrData[nvmOffset + 10], nvmeIoCtx->ptrData[nvmOffset + 9], nvmeIoCtx->ptrData[nvmOffset + 8]);
+#if defined (WIN_NVME_DEALLOCATE_CONTEXT_FAILURE)
                 if (nvmContextAttributes)
                 {
                     atLeastOneContextAttributeSet = true;
                 }
+#endif //WIN_NVME_DEALLOCATE_CONTEXT_FAILURE
                 //now translate it to a scsi unmap block descriptor
                 //LBA
                 unmapParameterData[scsiOffset + 0] = M_Byte7(nvmStartingLBA);
@@ -10803,8 +12114,8 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
             }
             //now set up the unmap parameter list header
             //unmap data length
-            unmapParameterData[0] = M_Byte1(unmapDataLength - 2);
-            unmapParameterData[1] = M_Byte0(unmapDataLength - 2);
+            unmapParameterData[0] = M_Byte1(unmapParameterDataLength - 2);
+            unmapParameterData[1] = M_Byte0(unmapParameterDataLength - 2);
             //block descriptor data length
             unmapParameterData[2] = M_Byte1(scsiOffset - 8);
             unmapParameterData[3] = M_Byte0(scsiOffset - 8);
@@ -10813,27 +12124,90 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
             unmapParameterData[5] = RESERVED;
             unmapParameterData[6] = RESERVED;
             unmapParameterData[7] = RESERVED;
-            //if (!atLeastOneContextAttributeSet) //This is commented out for now, but we can use it to return OS_COMMAND_NOT_SUPPORTED if we want to - TJE
+#if defined (WIN_NVME_DEALLOCATE_CONTEXT_FAILURE)
+            if (!atLeastOneContextAttributeSet)
+#endif //WIN_NVME_DEALLOCATE_CONTEXT_FAILURE
             {
                 //send the command
-                ret = scsi_Unmap(nvmeIoCtx->device, false, 0, C_CAST(uint16_t, unmapDataLength), unmapParameterData);
+                ret = scsi_Unmap(nvmeIoCtx->device, false, 0, unmapParameterDataLength, unmapParameterData);
             }
+#if defined (WIN_NVME_DEALLOCATE_CONTEXT_FAILURE)
+            else
+            {
+                ret = OS_COMMAND_NOT_AVAILABLE;
+            }
+#endif //WIN_NVME_DEALLOCATE_CONTEXT_FAILURE
+            safe_free_aligned(&unmapParameterData);
         }
         else
         {
             ret = MEMORY_FAILURE;
         }
-        safe_Free_aligned(unmapParameterData)
     }
     nvmeIoCtx->device->deviceVerbosity = inVerbosity;
     return ret;
 }
 
+//Sanitize in Windows is tricky.
+//For the longest time it was only available in Windows PE.
+//In the Win 10, 1607 update, the IOCTL for Storage Reinitialize Media was added, which supported crypto erase.
+//While this WAS working, it does not appear to work properly in the latest Windows 10 build and returns "Incorrect Function" meaning it
+//is not a supported API.
+//I did ask Microsoft a question about SCSI translation and they updated the docs to show the SCSI Sanitize CDB as supported for
+//Block and Crypto erase.
+//Since this IOCTL is not working in Win 10 22H2 for some unknown reason, this code will issue the SCSI CDB instead.
+//If we need to we can update this code to calling that IOCTL again, but the SSCI CDB's work the same without random errors. -TJE
+static eReturnValues win10_Translate_Sanitize(nvmeCmdCtx* nvmeIoCtx)
+{
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+    if (is_Windows_10_Version_1607_Or_Higher()) //this is for IOCTL reinitialize media. Not 100% sure when SCSI Sanitize CDB translation was supported. Update this if we ever find out.-TJE
+    {
+        //This was the original code for the reinitialize IOCTL.
+        //Since we ran into a weird compatibility issue, it is commented out.
+        //Will need to add some conditions for when to call it, but it will build and issue the IOCTL correctly-TJE
+        //#if defined (WIN_API_TARGET_VERSION) && WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
+        //    ret = nvme_Ioctl_Storage_Reinitialize_Media(nvmeIoCtx);
+        //#endif //WIN_API_TARGET_VERSION >= WIN_API_TARGET_WIN10_14393
+        uint8_t action = M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 2, 0);
+        //First check for fields that are not supported
+        if (M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 31, 10) > 0
+            || nvmeIoCtx->cmd.adminCmd.cdw10 & BIT9
+            || nvmeIoCtx->cmd.adminCmd.cdw10 & BIT8
+            || M_GETBITRANGE(nvmeIoCtx->cmd.adminCmd.cdw10, 7, 4) > 0
+            || action == 0 || action == 1 || action == 3 || action >= 5
+            || nvmeIoCtx->cmd.adminCmd.cdw11 != 0)
+        {
+            //Command not supported for translation
+            ret = OS_COMMAND_NOT_AVAILABLE;
+        }
+        else
+        {
+            //NOTE: immediate bit must be set to false for MSFT translation to work.
+            bool ause = M_ToBool(nvmeIoCtx->cmd.adminCmd.cdw10 & BIT3);
+            eVerbosityLevels temp = nvmeIoCtx->device->deviceVerbosity;
+            uint32_t currentTimeout = nvmeIoCtx->device->drive_info.defaultTimeoutSeconds;
+            nvmeIoCtx->device->drive_info.defaultTimeoutSeconds = 600;//change to 10 minutes since this does not return immediately in Windows-TJE
+            nvmeIoCtx->device->deviceVerbosity = VERBOSITY_QUIET;
+            if (action == 4) //crypto
+            {
+                ret = scsi_Sanitize_Cryptographic_Erase(nvmeIoCtx->device, ause, false, false);
+            }
+            else if (action == 2) //block
+            {
+                ret = scsi_Sanitize_Block_Erase(nvmeIoCtx->device, ause, false, false);
+            }
+            nvmeIoCtx->device->deviceVerbosity = temp;
+            nvmeIoCtx->device->drive_info.defaultTimeoutSeconds = currentTimeout;
+        }
+    }
+    return ret;
+}
+
 //These commands are not supported VIA SCSI translation. There are however other Windows IOCTLs that may work
-//static int win10_Translate_Reservation_Register(nvmeCmdCtx *nvmeIoCtx)
+//static eReturnValues win10_Translate_Reservation_Register(nvmeCmdCtx *nvmeIoCtx)
 //{
-//    int ret = OS_COMMAND_NOT_AVAILABLE;
-//    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+//    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+//    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
 //    //Command inputs
 //    uint8_t cptpl = M_GETBITRANGE(nvmeIoCtx->cmd.nvmCmd.cdw10, 31, 30);
 //    bool iekey = nvmeIoCtx->cmd.nvmCmd.cdw10 & BIT3;
@@ -10842,7 +12216,7 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
 //    //uint64_t crkey = M_BytesTo8ByteValue(nvmeIoCtx->ptrData[0], nvmeIoCtx->ptrData[1], nvmeIoCtx->ptrData[2], nvmeIoCtx->ptrData[3], nvmeIoCtx->ptrData[4], nvmeIoCtx->ptrData[5], nvmeIoCtx->ptrData[6], nvmeIoCtx->ptrData[7]);
 //    uint64_t nrkey = M_BytesTo8ByteValue(nvmeIoCtx->ptrData[8], nvmeIoCtx->ptrData[9], nvmeIoCtx->ptrData[10], nvmeIoCtx->ptrData[11], nvmeIoCtx->ptrData[12], nvmeIoCtx->ptrData[13], nvmeIoCtx->ptrData[14], nvmeIoCtx->ptrData[15]);
 //    //scsi command stuff
-//    uint8_t scsiCommandData[24] = { 0 };
+//    DECLARE_ZERO_INIT_ARRAY(uint8_t, scsiCommandData, 24);
 //    uint8_t scsiServiceAction = 0;
 //    bool issueSCSICommand = false;
 //    //now check that those can convert to SCSI...if they can, then convert it!
@@ -10911,15 +12285,14 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
 //    return ret;
 //}
 //
-//static int win10_Translate_Reservation_Report(nvmeCmdCtx *nvmeIoCtx)
+//static eReturnValues win10_Translate_Reservation_Report(nvmeCmdCtx *nvmeIoCtx)
 //{
-//    int ret = OS_COMMAND_NOT_AVAILABLE;
-//    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+//    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+//    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
 //    bool issueSCSICommand = false;
 //    //command bytes
 //    uint32_t numberOfDwords = nvmeIoCtx->cmd.nvmCmd.cdw10 + 1;
 //    bool eds = nvmeIoCtx->cmd.nvmCmd.cdw11 & BIT0;
-//    //TODO: need it issue possibly multiple scsi persistent reserve in commands to get the data we want...
 //    if (issueSCSICommand)
 //    {
 //        //if none of the above checks caught the command, then it cannot be translated
@@ -10930,10 +12303,10 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
 //    return ret;
 //}
 //
-//static int win10_Translate_Reservation_Acquire(nvmeCmdCtx *nvmeIoCtx)
+//static eReturnValues win10_Translate_Reservation_Acquire(nvmeCmdCtx *nvmeIoCtx)
 //{
-//    int ret = OS_COMMAND_NOT_AVAILABLE;
-//    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+//    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+//    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
 //    //Command inputs
 //    uint8_t rtype = M_GETBITRANGE(nvmeIoCtx->cmd.nvmCmd.cdw10, 15, 8);
 //    bool iekey = nvmeIoCtx->cmd.nvmCmd.cdw10 & BIT3;
@@ -10942,7 +12315,7 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
 //    //uint64_t crkey = M_BytesTo8ByteValue(nvmeIoCtx->ptrData[0], nvmeIoCtx->ptrData[1], nvmeIoCtx->ptrData[2], nvmeIoCtx->ptrData[3], nvmeIoCtx->ptrData[4], nvmeIoCtx->ptrData[5], nvmeIoCtx->ptrData[6], nvmeIoCtx->ptrData[7]);
 //    //uint64_t prkey = M_BytesTo8ByteValue(nvmeIoCtx->ptrData[8], nvmeIoCtx->ptrData[9], nvmeIoCtx->ptrData[10], nvmeIoCtx->ptrData[11], nvmeIoCtx->ptrData[12], nvmeIoCtx->ptrData[13], nvmeIoCtx->ptrData[14], nvmeIoCtx->ptrData[15]);
 //    //scsi command stuff
-//    uint8_t scsiCommandData[24] = { 0 };
+//    DECLARE_ZERO_INIT_ARRAY(uint8_t, scsiCommandData, 24);
 //    uint8_t scsiServiceAction = 0;
 //    uint8_t scsiType = 0xF;
 //    switch (rtype)
@@ -11015,10 +12388,10 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
 //    return ret;
 //}
 //
-//static int win10_Translate_Reservation_Release(nvmeCmdCtx *nvmeIoCtx)
+//static eReturnValues win10_Translate_Reservation_Release(nvmeCmdCtx *nvmeIoCtx)
 //{
-//    int ret = OS_COMMAND_NOT_AVAILABLE;
-//    int inVerbosity = nvmeIoCtx->device->deviceVerbosity;
+//    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
+//    eVerbosityLevels inVerbosity = nvmeIoCtx->device->deviceVerbosity;
 //    //Command inputs
 //    uint8_t rtype = M_GETBITRANGE(nvmeIoCtx->cmd.nvmCmd.cdw10, 15, 8);
 //    bool iekey = nvmeIoCtx->cmd.nvmCmd.cdw10 & BIT3;
@@ -11026,7 +12399,7 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
 //    //data structure inputs
 //    //uint64_t crkey = M_BytesTo8ByteValue(nvmeIoCtx->ptrData[0], nvmeIoCtx->ptrData[1], nvmeIoCtx->ptrData[2], nvmeIoCtx->ptrData[3], nvmeIoCtx->ptrData[4], nvmeIoCtx->ptrData[5], nvmeIoCtx->ptrData[6], nvmeIoCtx->ptrData[7]);
 //    //scsi command stuff
-//    uint8_t scsiCommandData[24] = { 0 };
+//    DECLARE_ZERO_INIT_ARRAY(uint8_t, scsiCommandData, 24);
 //    uint8_t scsiServiceAction = 0;
 //    uint8_t scsiType = 0xF;
 //    switch (rtype)
@@ -11089,25 +12462,25 @@ static int win10_Translate_Data_Set_Management(nvmeCmdCtx *nvmeIoCtx)
 
 //Windows 10 added a way to query for ATA identify data. Seems to work ok.
 //Note: Any odd parameters like a change in TFRs from the spec will not work here.
-int send_Win_ATA_Identify_Cmd(ScsiIoCtx *scsiIoCtx)
+eReturnValues send_Win_ATA_Identify_Cmd(ScsiIoCtx *scsiIoCtx)
 {
-    int32_t returnValue = SUCCESS;
-    BOOL    result;
-    PVOID   buffer = NULL;
-    ULONG   bufferLength = 0;
-    ULONG   returnedLength = 0;
+    eReturnValues returnValue = SUCCESS;
+    BOOL result;
+    PVOID buffer = M_NULLPTR;
+    ULONG bufferLength = 0;
+    ULONG returnedLength = 0;
 
-    PSTORAGE_PROPERTY_QUERY query = NULL;
-    PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = NULL;
-    PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = NULL;
+    PSTORAGE_PROPERTY_QUERY query = M_NULLPTR;
+    PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = M_NULLPTR;
+    PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = M_NULLPTR;
 
     //
     // Allocate buffer for use.
     //
     bufferLength = FIELD_OFFSET(STORAGE_PROPERTY_QUERY, AdditionalParameters) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) + scsiIoCtx->dataLength;
-    buffer = malloc(bufferLength);
+    buffer = safe_malloc(bufferLength);
 
-    if (buffer == NULL) {
+    if (buffer == M_NULLPTR) {
 #if defined (_DEBUG)
         printf("%s: allocate buffer failed, exit", __FUNCTION__);
 #endif
@@ -11149,7 +12522,7 @@ int send_Win_ATA_Identify_Cmd(ScsiIoCtx *scsiIoCtx)
         buffer,
         bufferLength,
         &returnedLength,
-        NULL
+        M_NULLPTR
     );
     stop_Timer(&commandTimer);
     scsiIoCtx->device->os_info.last_error = GetLastError();
@@ -11191,30 +12564,30 @@ int send_Win_ATA_Identify_Cmd(ScsiIoCtx *scsiIoCtx)
         memcpy(scsiIoCtx->pdata, C_CAST(void*, logData), scsiIoCtx->dataLength);
     }
 
-    safe_Free(buffer)
+    safe_free(&buffer);
 
     return returnValue;
 }
 
-int send_Win_ATA_Get_Log_Page_Cmd(ScsiIoCtx *scsiIoCtx)
+eReturnValues send_Win_ATA_Get_Log_Page_Cmd(ScsiIoCtx *scsiIoCtx)
 {
-    int32_t returnValue = SUCCESS;
-    BOOL    result;
-    PVOID   buffer = NULL;
-    ULONG   bufferLength = 0;
-    ULONG   returnedLength = 0;
+    eReturnValues returnValue = SUCCESS;
+    BOOL result;
+    PVOID buffer = M_NULLPTR;
+    ULONG bufferLength = 0;
+    ULONG returnedLength = 0;
 
-    PSTORAGE_PROPERTY_QUERY query = NULL;
-    PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = NULL;
-    PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = NULL;
+    PSTORAGE_PROPERTY_QUERY query = M_NULLPTR;
+    PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = M_NULLPTR;
+    PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = M_NULLPTR;
 
     //
     // Allocate buffer for use.
     //
     bufferLength = FIELD_OFFSET(STORAGE_PROPERTY_QUERY, AdditionalParameters) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) + scsiIoCtx->dataLength + 4096;
-    buffer = malloc(bufferLength);
+    buffer = safe_malloc(bufferLength);
 
-    if (buffer == NULL) {
+    if (buffer == M_NULLPTR) {
 #if defined (_DEBUG)
         printf("%s: allocate buffer failed, exit", __FUNCTION__);
 #endif
@@ -11256,12 +12629,11 @@ int send_Win_ATA_Get_Log_Page_Cmd(ScsiIoCtx *scsiIoCtx)
         buffer,
         bufferLength,
         &returnedLength,
-        NULL
+        M_NULLPTR
     );
     stop_Timer(&commandTimer);
     scsiIoCtx->device->os_info.last_error = GetLastError();
     scsiIoCtx->device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
-    //TODO: we dummy up RTFRs
     if (!result || (returnedLength == 0))
     {
         if (scsiIoCtx->device->deviceVerbosity >= VERBOSITY_COMMAND_VERBOSE)
@@ -11299,7 +12671,7 @@ int send_Win_ATA_Get_Log_Page_Cmd(ScsiIoCtx *scsiIoCtx)
         memcpy(scsiIoCtx->pdata, C_CAST(void*, logData), scsiIoCtx->dataLength);
     }
 
-    safe_Free(buffer)
+    safe_free(&buffer);
 
     return returnValue;
 }
@@ -11313,14 +12685,14 @@ int send_Win_ATA_Get_Log_Page_Cmd(ScsiIoCtx *scsiIoCtx)
 //command set support: https://docs.microsoft.com/en-us/windows-hardware/drivers/storage/stornvme-command-set-support
 //feature set support: https://docs.microsoft.com/en-us/windows-hardware/drivers/storage/stornvme-feature-support
 //Most of the code below has been updated according to these docs, however some things may be missing and those enhancements should be made to better improve support.
-static int send_Win_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
+static eReturnValues send_Win_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
+#if !defined (DISABLE_NVME_PASSTHROUGH)
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
     //TODO: Should we be checking the nsid in each command before issuing it? This should happen at some point, at least to filter out "all namespaces" for certain commands since MS won't let us issue some of them through their API - TJE
     if (nvmeIoCtx->commandType == NVM_ADMIN_CMD)
     {
 #if WINVER >= SEA_WIN32_WINNT_WIN10 //This should wrap around anything going through the Windows API...Win 10 is required for NVMe IOs
-        //TODO: If different versions of Windows 10 API support different commands, then check WIN_API_TARGET_VERSION to see which version of the API is in use to filter this list better. - TJE
         bool useNVMPassthrough = false;//this is only true when attempting the command with the generic storage protocol command IOCTL which is supposed to be used for VU commands only. - TJE
         switch (nvmeIoCtx->cmd.adminCmd.opcode)
         {
@@ -11330,11 +12702,11 @@ static int send_Win_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
         case NVME_ADMIN_CMD_GET_LOG_PAGE:
             //Notes about telemetry log:
             /*
-            Supported through IOCTL_SCSI_PASS_THROUGH using command SCSIOP_READ_DATA_BUFF16 with buffer mode as READ_BUFFER_MODE_ERROR_HISTORY. 
-            Also available through StorageAdapterProtocolSpecificProperty/StorageDeviceProtocolSpecificProperty from IOCTL_STORAGE_QUERY_PROPERTY. 
+            Supported through IOCTL_SCSI_PASS_THROUGH using command SCSIOP_READ_DATA_BUFF16 with buffer mode as READ_BUFFER_MODE_ERROR_HISTORY.
+            Also available through StorageAdapterProtocolSpecificProperty/StorageDeviceProtocolSpecificProperty from IOCTL_STORAGE_QUERY_PROPERTY.
             For host telemetry, this is also available through IOCTL_STORAGE_GET_DEVICE_INTERNAL_LOG.
+            Older versions of Win10 do not allow pulling in segments with storage query property. May need to check Windows 10 version to change between APIs to get this data.-TJE
             */
-            //TODO: Since the storage query property doesn't allow pulling in segments today, we may want to try SCSI translation using read buffer 16. Will need to figure out buffer ID, but this should be doable.
             ret = send_Win_NVMe_Get_Log_Page_Cmd(nvmeIoCtx);
             break;
         case NVME_ADMIN_CMD_GET_FEATURES:
@@ -11371,17 +12743,35 @@ static int send_Win_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
         case NVME_ADMIN_CMD_SET_FEATURES:
             ret = send_NVMe_Set_Features_Win10(nvmeIoCtx, &useNVMPassthrough);
             break;
-        case NVME_ADMIN_CMD_FORMAT_NVM: //This can be done with a couple IOCTLs, but we should use STORAGE_PROTOCOL_COMMAND since it allows us to specify everything. In WinPE, a SCSI translation from SCSI sanitize is possible (which is non-standard);IOCTL_STORAGE_REINITIALIZE_MEDIA can only do the format with crypto erase
-            //ret = win10_Translate_Format(nvmeIoCtx);
-            //break;
+        case NVME_ADMIN_CMD_FORMAT_NVM:
+            if (is_Windows_PE())
+            {
+                useNVMPassthrough = true;
+            }
+#if defined (ENABLE_TRANSLATE_FORMAT)
+            else
+            {
+                ret = win10_Translate_Format(nvmeIoCtx);
+            }
+#endif //ENABLE_TRANSLATE_FORMAT
+            break;
         case NVME_ADMIN_CMD_NAMESPACE_MANAGEMENT:
         case NVME_ADMIN_CMD_NAMESPACE_ATTACHMENT:
         case NVME_ADMIN_CMD_NVME_MI_SEND:
         case NVME_ADMIN_CMD_NVME_MI_RECEIVE:
+            if (is_Windows_PE())
+            {
+                useNVMPassthrough = true;
+            }
+            break;
         case NVME_ADMIN_CMD_SANITIZE:
             if (is_Windows_PE())
             {
                 useNVMPassthrough = true;
+            }
+            else
+            {
+                ret = win10_Translate_Sanitize(nvmeIoCtx);
             }
             break;
         case NVME_ADMIN_CMD_DEVICE_SELF_TEST:
@@ -11408,7 +12798,6 @@ static int send_Win_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
     else if (nvmeIoCtx->commandType == NVM_CMD)
     {
 #if WINVER >= SEA_WIN32_WINNT_WIN10 //This should wrap around anything going through the Windows API...Win 10 is required for NVMe IOs
-        //TODO: If different versions of Windows 10 API support different commands, then check WIN_API_TARGET_VERSION to see which version of the API is in use to filter this list better. - TJE
         bool useNVMPassthrough = false;//this is only true when attempting the command with the generic storage protocol command IOCTL which is supposed to be used for VU commands only. - TJE
         switch (nvmeIoCtx->cmd.adminCmd.opcode)
         {
@@ -11451,11 +12840,15 @@ static int send_Win_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
 #endif
     }
     return ret;
+#else //DISABLE_NVME_PASSTHROUGH
+    M_USE_UNUSED(nvmeIoCtx);
+    return OS_COMMAND_NOT_AVAILABLE;
+#endif //DISBALE_NVME_PASSTHROUGH
 }
 
-int send_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
+eReturnValues send_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
 {
-    int ret = OS_PASSTHROUGH_FAILURE;
+    eReturnValues ret = OS_PASSTHROUGH_FAILURE;
     switch (nvmeIoCtx->device->drive_info.interface_type)
     {
     case NVME_INTERFACE:
@@ -11478,7 +12871,7 @@ int send_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
         }
         break;
     case RAID_INTERFACE:
-        if (nvmeIoCtx->device->issue_nvme_io != NULL)
+        if (nvmeIoCtx->device->issue_nvme_io != M_NULLPTR)
         {
             ret = nvmeIoCtx->device->issue_nvme_io(nvmeIoCtx);
         }
@@ -11499,12 +12892,22 @@ int send_NVMe_IO(nvmeCmdCtx *nvmeIoCtx)
         ret = BAD_PARAMETER;
         break;
     }
+
+    if (nvmeIoCtx->device->delay_io)
+    {
+        delay_Milliseconds(nvmeIoCtx->device->delay_io);
+        if (VERBOSITY_COMMAND_NAMES <= nvmeIoCtx->device->deviceVerbosity)
+        {
+            printf("Delaying between commands %d seconds to reduce IO impact", nvmeIoCtx->device->delay_io);
+        }
+    }
+
     return ret;
 }
 
-int os_nvme_Reset(tDevice *device)
+eReturnValues os_nvme_Reset(tDevice *device)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
     //This is a stub. We may not be able to do this in Windows, but want this here in case we can and to make code otherwise compile without ifdefs
     if (device->deviceVerbosity > VERBOSITY_COMMAND_NAMES)
     {
@@ -11523,9 +12926,9 @@ int os_nvme_Reset(tDevice *device)
     return ret;
 }
 
-int os_nvme_Subsystem_Reset(tDevice *device)
+eReturnValues os_nvme_Subsystem_Reset(tDevice *device)
 {
-    int ret = OS_COMMAND_NOT_AVAILABLE;
+    eReturnValues ret = OS_COMMAND_NOT_AVAILABLE;
     //This is a stub. We may not be able to do this in Windows, but want this here in case we can and to make code otherwise compile without ifdefs
     if (device->deviceVerbosity > VERBOSITY_COMMAND_NAMES)
     {
@@ -11544,35 +12947,230 @@ int os_nvme_Subsystem_Reset(tDevice *device)
     return ret;
 }
 
-int pci_Read_Bar_Reg(M_ATTR_UNUSED tDevice * device, M_ATTR_UNUSED uint8_t * pData, M_ATTR_UNUSED uint32_t dataSize)
+eReturnValues pci_Read_Bar_Reg(M_ATTR_UNUSED tDevice * device, M_ATTR_UNUSED uint8_t * pData, M_ATTR_UNUSED uint32_t dataSize)
 {
     return NOT_SUPPORTED;
 }
+
+static eReturnValues open_Force_Unit_Access_Handle_For_OS_Read_OS_Write(tDevice* device)
+{
+    eReturnValues ret = SUCCESS;
+    if (device->os_info.forceUnitAccessRWfd == M_NULLPTR || device->os_info.forceUnitAccessRWfd == INVALID_HANDLE_VALUE)
+    {
+        //handle is not yet opened
+        //FILE_FLAG_NO_BUFFERING - this is for the operating system/file system caching. NOT THE DISK!
+        //FILE_FLAG_WRITE_THROUGH - this seems to mean FUA based on the description of the flag
+        // The following link describes the flags. It sounds like we need both of them for FUA otherwise it may go to the system cache and then be flushed, which may not be the same- TJE
+        //See here for more info: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea#caching_behavior
+        DECLARE_ZERO_INIT_ARRAY(TCHAR, fuaDevice, WIN_MAX_DEVICE_NAME_LENGTH);
+        TCHAR* ptrFuaDevice = &fuaDevice[0];
+        _stprintf_s(fuaDevice, WIN_MAX_DEVICE_NAME_LENGTH, TEXT("%hs"), device->os_info.name);
+        device->os_info.forceUnitAccessRWfd = CreateFile(ptrFuaDevice, GENERIC_WRITE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, M_NULLPTR, OPEN_EXISTING,
+            FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING |
+#if !defined(WINDOWS_DISABLE_OVERLAPPED)
+            FILE_FLAG_OVERLAPPED,
 #endif
+            M_NULLPTR);
+        if (device->os_info.forceUnitAccessRWfd == INVALID_HANDLE_VALUE)
+        {
+            ret = NOT_SUPPORTED;//Or should this be set to failure??? - TJE
+        }
+    }
+    return ret;
+}
+
+static eReturnValues set_Command_Completion_For_OS_Read_Write(tDevice* device, DWORD lastError)
+{
+    eReturnValues ret = SUCCESS;
+    //clear the last command sense data and rtfrs. We'll dummy them up in a minute
+    memset(&device->drive_info.lastCommandRTFRs, 0, sizeof(ataReturnTFRs));
+    memset(device->drive_info.lastCommandSenseData, 0, SPC3_SENSE_LEN);
+    if (lastError == ERROR_SUCCESS)
+    {
+        device->drive_info.lastNVMeResult.lastNVMeCommandSpecific = 0;
+        device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_SUCCESS_);
+        if (device->drive_info.drive_type == ATA_DRIVE)
+        {
+            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE;
+        }
+    }
+    else
+    {
+        uint8_t senseKey = 0;
+        uint8_t asc = 0;
+        uint8_t ascq = 0;
+        ret = FAILURE;
+        //For nvme, set the NVMe status as best we can, then fall through and set SCSI style sense data as well.
+        //This switch case will handle many, if not all the same cases as SCSI below, but this seemed like the easier way to solve this problem for now. - TJE
+        //if the DISABLE_NVME_PASSTHROUGH flag is refactored, this can probably be cleaned up a lot - TJE
+        device->drive_info.lastNVMeResult.lastNVMeCommandSpecific = 0;//cannot report this as far as I know, so clear it to zero
+        switch (lastError)
+        {
+        case ERROR_NOT_READY://sense key not ready
+            //namespace not ready
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_NS_NOT_READY_);
+            break;
+        case ERROR_WRITE_PROTECT:
+            //attempted to write to read-only range
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_COMMAND_SPECIFIC_STATUS, NVME_CMD_SP_SC_ATTEMPTED_WRITE_TO_READ_ONLY_RANGE);
+            break;
+        case ERROR_WRITE_FAULT:
+            //write fault
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_MEDIA_AND_DATA_INTEGRITY_ERRORS, NVME_MED_ERR_SC_WRITE_FAULT_);
+            break;
+        case ERROR_READ_FAULT://should this be "Deallocated or unwritten logical block on NVME?
+        case ERROR_DEVICE_HARDWARE_ERROR:
+            //internal device error
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_INTERNAL_);
+            break;
+        case ERROR_CRC: //medium error, uncorrectable data
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_MEDIA_AND_DATA_INTEGRITY_ERRORS, NVME_MED_ERR_SC_UNREC_READ_ERROR_);
+            break;
+        case ERROR_SEEK://cannot find area or track on disk?
+            M_FALLTHROUGH; //Fallthrough for now unless we can figure out a better, more specific error when this happens - TJE
+        case ERROR_SECTOR_NOT_FOUND://ID not found (beyond max LBA type error)
+            //lba out of range
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_LBA_RANGE_);
+            break;
+        case ERROR_OFFSET_ALIGNMENT_VIOLATION://alignment error for the device
+            //namespace not ready??? THere doesn't seem to be anything similar in the spec like SAS/SATA have...probably because LBAs don't report differing logical and physical size
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_NS_NOT_READY_);
+            break;
+        case ERROR_TIMEOUT:
+            //command abort requested. Assume this system asked to abort this when it took too long
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_ABORT_REQ_);
+            break;
+        case ERROR_DEVICE_NOT_CONNECTED://CRC error???
+            //data transfer error?
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_DATA_XFER_ERROR_);
+            break;
+        case ERROR_BAD_COMMAND:
+            //invalid op code??? or invalid field in command? no idea...-TJE
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_INVALID_OPCODE_);
+            break;
+        case ERROR_INVALID_DATA://Not sure if this is the same as CRC or something else, so this may need changing if we see it in the future.
+        case ERROR_DATA_CHECKSUM_ERROR://Not sure if this will show up for RAW IO like this is doing or not, but we may need a case for this in the future.
+            //data transfer error?
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_DATA_XFER_ERROR_);
+            break;
+        default:
+            //setting to abort requested since we don't know what else to set...generic enough
+            device->drive_info.lastNVMeResult.lastNVMeStatus = WIN_DUMMY_NVME_STATUS(NVME_SCT_GENERIC_COMMAND_STATUS, NVME_GEN_SC_ABORT_REQ_);
+            break;
+        }
+
+        //failure for one reason or another. The last error may or may not tell us exactly what happened.
+        if (device->drive_info.drive_type == ATA_DRIVE)
+        {
+            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_ERROR;
+        }
+        device->drive_info.lastCommandSenseData[0] = SCSI_SENSE_CUR_INFO_FIXED;
+        switch (device->os_info.last_error)
+        {
+            //Some of these are in here "just in case", but this is not a comprehensive list of what could be returned. Some may never be returned, others may not be in this list and are falling to the default case - TJE
+            //The only one I haven't been able to find a good answer for is an interface CRC error, which are hard to create and test for - TJE
+        case ERROR_NOT_READY://sense key not ready...not sure this matches anything in ATA if this even were to happen there.
+            senseKey = SENSE_KEY_NOT_READY;
+            //no other information can be provided
+            break;
+        case ERROR_WRITE_PROTECT:
+            senseKey = SENSE_KEY_DATA_PROTECT;
+            asc = 0x27;
+            ascq = 0x00;
+            break;
+        case ERROR_WRITE_FAULT:
+        case ERROR_READ_FAULT:
+        case ERROR_DEVICE_HARDWARE_ERROR:
+            senseKey = SENSE_KEY_HARDWARE_ERROR;
+            asc = 0x44;
+            ascq = 0;
+            if (device->drive_info.drive_type == ATA_DRIVE)
+            {
+                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_DEVICE_FAULT;
+            }
+            break;
+        case ERROR_CRC: //medium error, uncorrectable data
+            senseKey = SENSE_KEY_MEDIUM_ERROR;
+            asc = 0x11;
+            ascq = 0;
+            if (device->drive_info.drive_type == ATA_DRIVE)
+            {
+                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_UNCORRECTABLE_DATA;
+            }
+            break;
+        case ERROR_SEEK://cannot find area or track on disk?
+            M_FALLTHROUGH; //Fallthrough for now unless we can figure out a better, more specific error when this happens - TJE
+        case ERROR_SECTOR_NOT_FOUND://ID not found (beyond max LBA type error)
+            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+            asc = 0x21;
+            ascq = 0x00;
+            if (device->drive_info.drive_type == ATA_DRIVE)
+            {
+                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_ID_NOT_FOUND;
+            }
+            break;
+        case ERROR_OFFSET_ALIGNMENT_VIOLATION://alignment error for the device
+            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
+            asc = 0x21;
+            ascq = 0x04;//technically this is "unaligned write command" which would not be accurate with a read, but this is the best I can do right now....maybe 07 for read boundary error???
+            if (device->drive_info.drive_type == ATA_DRIVE)
+            {
+                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_ALIGNMENT_ERROR;
+            }
+            break;
+        case ERROR_TIMEOUT:
+            senseKey = SENSE_KEY_ABORTED_COMMAND;
+            break;
+        case ERROR_DEVICE_NOT_CONNECTED://CRC error???
+            senseKey = SENSE_KEY_MEDIUM_ERROR;
+            //INFORMATION UNIT iuCRC ERROR DETECTED
+            asc = 0x47;
+            ascq = 0x03;
+            break;
+        case ERROR_BAD_COMMAND:
+        case ERROR_INVALID_DATA://Not sure if this is the same as CRC or something else, so this may need changing if we see it in the future.
+        case ERROR_DATA_CHECKSUM_ERROR://Not sure if this will show up for RAW IO like this is doing or not, but we may need a case for this in the future.
+        default:
+            //set the sense key to aborted command...don't set the asc or ascq since we don't know what to set those to right now
+            senseKey = SENSE_KEY_ABORTED_COMMAND;
+            break;
+        }
+        device->drive_info.lastCommandSenseData[2] |= senseKey;
+        if (asc || ascq)
+        {
+            device->drive_info.lastCommandSenseData[7] = 6;//get to bytes 12 & 13 for asc info...or should this change to a value of 7 to include fru, even though that is impossible for us to figure out??? - TJE
+            device->drive_info.lastCommandSenseData[12] = asc;
+            device->drive_info.lastCommandSenseData[13] = ascq;
+        }
+    }
+    return ret;
+}
+
 //The overlapped structure used here changes it to asynchronous IO, but the synchronous portions of code are left here in case the device responds as a synchronous device
 //and ignores the overlapped strucutre...it SHOULD work on any device like this.
 //See here: https://msdn.microsoft.com/en-us/library/windows/desktop/aa365683(v=vs.85).aspx
-int os_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_t dataSize)
+eReturnValues os_Read(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t *ptrData, uint32_t dataSize)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
+    eReturnValues openFUA = SUCCESS;
+    HANDLE handleToUse = device->os_info.fd;
     if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
     {
         printf("Using Windows API to Read LBAs\n");
     }
-    if (async)
+    if (forceUnitAccess)
     {
-        //asynchronous IO is not supported right now
-        if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
+        openFUA = open_Force_Unit_Access_Handle_For_OS_Read_OS_Write(device);
+        if (openFUA == SUCCESS)
         {
-            print_Return_Enum("Windows API Read", NOT_SUPPORTED);
+            handleToUse = device->os_info.forceUnitAccessRWfd;
         }
-        return NOT_SUPPORTED;
     }
     //used for setting the timeout
     COMMTIMEOUTS comTimeout;
     memset(&comTimeout, 0, sizeof(COMMTIMEOUTS));
     /*BOOL timeoutGot = */
-    GetCommTimeouts(device->os_info.fd, &comTimeout);//get timeouts if possible before trying to change them...
+    GetCommTimeouts(handleToUse, &comTimeout);//get timeouts if possible before trying to change them...
     uint64_t timeoutInSeconds = 0;
     if (device->drive_info.defaultTimeoutSeconds == 0)
     {
@@ -11585,14 +13183,17 @@ int os_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_
         timeoutInSeconds = device->drive_info.defaultTimeoutSeconds;
     }
     /*BOOL timeoutSet = */
-    SetCommTimeouts(device->os_info.fd, &comTimeout);
+    SetCommTimeouts(handleToUse, &comTimeout);
     device->os_info.last_error = GetLastError();
     //for use by the setFilePointerEx function
-    LARGE_INTEGER liDistanceToMove = { 0 }, lpNewFilePointer = { 0 };
+    LARGE_INTEGER liDistanceToMove;
+    memset(&liDistanceToMove, 0, sizeof(LARGE_INTEGER));
+    LARGE_INTEGER lpNewFilePointer;
+    memset(&lpNewFilePointer, 0, sizeof(LARGE_INTEGER));
     //set the distance to move in bytes
     liDistanceToMove.QuadPart = C_CAST(LONGLONG, lba * device->drive_info.deviceBlockSize);
     //set the offset here
-    BOOL retStatus = SetFilePointerEx(device->os_info.fd, liDistanceToMove, &lpNewFilePointer, FILE_BEGIN);
+    BOOL retStatus = SetFilePointerEx(handleToUse, liDistanceToMove, &lpNewFilePointer, FILE_BEGIN);
     if (!retStatus)
     {
         if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
@@ -11608,16 +13209,21 @@ int os_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_
     memset(&commandTimer, 0, sizeof(seatimer_t));
     OVERLAPPED overlappedStruct;
     memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-    overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
     overlappedStruct.Offset = M_DoubleWord0(lba * device->drive_info.deviceBlockSize);
     overlappedStruct.OffsetHigh = M_DoubleWord1(lba * device->drive_info.deviceBlockSize);
     SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
     start_Timer(&commandTimer);
-    retStatus = ReadFile(device->os_info.fd, ptrData, dataSize, &bytesReturned, &overlappedStruct);
+    if (forceUnitAccess && openFUA != SUCCESS)
+    {
+        //could not get a FUA handle...so emulate with a verify command before the read - TJE
+        os_Verify(device, lba, dataSize / device->drive_info.deviceBlockSize);
+    }
+    retStatus = ReadFile(handleToUse, ptrData, dataSize, &bytesReturned, &overlappedStruct);
     device->os_info.last_error = GetLastError();
     if (ERROR_IO_PENDING == device->os_info.last_error)//This will only happen for overlapped commands. If the drive is opened without the overlapped flag, everything will work like old synchronous code.-TJE
     {
-        retStatus = GetOverlappedResult(device->os_info.fd, &overlappedStruct, &bytesReturned, TRUE);
+        retStatus = GetOverlappedResult(handleToUse, &overlappedStruct, &bytesReturned, TRUE);
     }
     else if (device->os_info.last_error != ERROR_SUCCESS)
     {
@@ -11628,7 +13234,7 @@ int os_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_
     if (overlappedStruct.hEvent)
     {
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
     }
     device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
 
@@ -11644,7 +13250,7 @@ int os_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_
     {
         print_Command_Time(device->drive_info.lastCommandTimeNanoSeconds);
     }
-    if (VERBOSITY_BUFFERS <= device->deviceVerbosity && ptrData != NULL)
+    if (VERBOSITY_BUFFERS <= device->deviceVerbosity && ptrData != M_NULLPTR)
     {
         printf("\t  Data Buffer being returned:\n");
         print_Data_Buffer(ptrData, dataSize, true);
@@ -11657,115 +13263,12 @@ int os_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_
         ret = FAILURE;
     }
 
-    //clear the last command sense data and rtfrs. We'll dummy them up in a minute
-    memset(&device->drive_info.lastCommandRTFRs, 0, sizeof(ataReturnTFRs));
-    memset(device->drive_info.lastCommandSenseData, 0, SPC3_SENSE_LEN);
-
-    if (retStatus)
-    {
-        //successful read
-        if (device->drive_info.drive_type == ATA_DRIVE)
-        {
-            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE;
-        }
-        ret = SUCCESS;
-    }
-    else
-    {
-        uint8_t senseKey = 0, asc = 0, ascq = 0;
-        ret = FAILURE;
-        //failure for one reason or another. The last error may or may not tell us exactly what happened.
-        if (device->drive_info.drive_type == ATA_DRIVE)
-        {
-            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_ERROR;
-        }
-        device->drive_info.lastCommandSenseData[0] = SCSI_SENSE_CUR_INFO_FIXED;
-
-        switch (device->os_info.last_error)
-        {
-            //Some of these are in here "just in case", but this is not a comprehensive list of what could be returned. Some may never be returned, others may not be in this list and are falling to the default case - TJE
-            //The only one I haven't been able to find a good answer for is an interface CRC error, which are hard to create and test for - TJE
-        case ERROR_NOT_READY://sense key not ready...not sure this matches anything in ATA if this even were to happen there.
-            senseKey = SENSE_KEY_NOT_READY;
-            //no other information can be provided
-            break;
-        case ERROR_WRITE_PROTECT:
-            senseKey = SENSE_KEY_DATA_PROTECT;
-            asc = 0x27;
-            ascq = 0x00;
-            //TODO: Not sure what to do about ATA here...there is not a direct translation
-            break;
-        case ERROR_WRITE_FAULT:
-        case ERROR_READ_FAULT:
-        case ERROR_DEVICE_HARDWARE_ERROR:
-            senseKey = SENSE_KEY_HARDWARE_ERROR;
-            asc = 0x44;
-            ascq = 0;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_DEVICE_FAULT;
-            }
-            break;
-        case ERROR_CRC: //medium error, uncorrectable data
-            senseKey = SENSE_KEY_MEDIUM_ERROR;
-            asc = 0x11;
-            ascq = 0;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_UNCORRECTABLE_DATA;
-            }
-            break;
-        case ERROR_SEEK://cannot find area or track on disk?
-            M_FALLTHROUGH //Fallthrough for now unless we can figure out a better, more specific error when this happens - TJE
-        case ERROR_SECTOR_NOT_FOUND://ID not found (beyond max LBA type error)
-            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
-            asc = 0x21;
-            ascq = 0x00;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_ID_NOT_FOUND;
-            }
-            break;
-        case ERROR_OFFSET_ALIGNMENT_VIOLATION://alignment error for the device
-            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
-            asc = 0x21;
-            ascq = 0x04;//technically this is "unaligned write command" which would not be accurate with a read, but this is the best I can do right now....maybe 07 for read boundary error???
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_ALIGNMENT_ERROR;
-            }
-            break;
-        case ERROR_TIMEOUT:
-            senseKey = SENSE_KEY_ABORTED_COMMAND;
-            ret = COMMAND_TIMEOUT;
-            break;
-        case ERROR_DEVICE_NOT_CONNECTED://CRC error???
-            senseKey = SENSE_KEY_MEDIUM_ERROR;
-            //INFORMATION UNIT iuCRC ERROR DETECTED
-            asc = 0x47;
-            ascq = 0x03;
-            break;
-        case ERROR_BAD_COMMAND:
-        case ERROR_INVALID_DATA://Not sure if this is the same as CRC or something else, so this may need changing if we see it in the future.
-        case ERROR_DATA_CHECKSUM_ERROR://Not sure if this will show up for RAW IO like this is doing or not, but we may need a case for this in the future.
-        default:
-            //set the sense key to aborted command...don't set the asc or ascq since we don't know what to set those to right now
-            senseKey = SENSE_KEY_ABORTED_COMMAND;
-            break;
-        }
-        device->drive_info.lastCommandSenseData[2] |= senseKey;
-        if (asc || ascq)
-        {
-            device->drive_info.lastCommandSenseData[7] = 6;//get to bytes 12 & 13 for asc info...or should this change to a value of 7 to include fru, even though that is impossible for us to figure out??? - TJE
-            device->drive_info.lastCommandSenseData[12] = asc;
-            device->drive_info.lastCommandSenseData[13] = ascq;
-        }
-    }
+    ret = set_Command_Completion_For_OS_Read_Write(device, device->os_info.last_error);
 
     //check for command timeout
     if ((device->drive_info.lastCommandTimeNanoSeconds / 1000000000) >= timeoutInSeconds)
     {
-        ret = COMMAND_TIMEOUT;
+        ret = OS_COMMAND_TIMEOUT;
     }
     if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
     {
@@ -11774,27 +13277,28 @@ int os_Read(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_
     return ret;
 }
 
-int os_Write(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32_t dataSize)
+eReturnValues os_Write(tDevice *device, uint64_t lba, bool forceUnitAccess, uint8_t *ptrData, uint32_t dataSize)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
+    eReturnValues openFUA = SUCCESS;
+    HANDLE handleToUse = device->os_info.fd;
     if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
     {
         printf("Using Windows API to Write LBAs\n");
     }
-    if (async)
+    if (forceUnitAccess)
     {
-        //asynchronous IO is not supported right now
-        if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
+        openFUA = open_Force_Unit_Access_Handle_For_OS_Read_OS_Write(device);
+        if (openFUA == SUCCESS)
         {
-            print_Return_Enum("Windows API Write", NOT_SUPPORTED);
+            handleToUse = device->os_info.forceUnitAccessRWfd;
         }
-        return NOT_SUPPORTED;
     }
     //used for setting the timeout
     COMMTIMEOUTS comTimeout;
     memset(&comTimeout, 0, sizeof(COMMTIMEOUTS));
     /*BOOL timeoutGot = */
-    GetCommTimeouts(device->os_info.fd, &comTimeout);//get timeouts if possible before trying to change them...
+    GetCommTimeouts(handleToUse, &comTimeout);//get timeouts if possible before trying to change them...
     uint64_t timeoutInSeconds = 0;
     if (device->drive_info.defaultTimeoutSeconds == 0)
     {
@@ -11807,14 +13311,17 @@ int os_Write(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32
         timeoutInSeconds = device->drive_info.defaultTimeoutSeconds;
     }
     /*BOOL timeoutSet = */
-    SetCommTimeouts(device->os_info.fd, &comTimeout);
+    SetCommTimeouts(handleToUse, &comTimeout);
     device->os_info.last_error = GetLastError();
     //for use by the setFilePointerEx function
-    LARGE_INTEGER liDistanceToMove = { 0 }, lpNewFilePointer = { 0 };
+    LARGE_INTEGER liDistanceToMove;
+    memset(&liDistanceToMove, 0, sizeof(LARGE_INTEGER));
+    LARGE_INTEGER lpNewFilePointer;
+    memset(&lpNewFilePointer, 0, sizeof(LARGE_INTEGER));
     //set the distance to move in bytes
     liDistanceToMove.QuadPart = C_CAST(LONGLONG, lba * device->drive_info.deviceBlockSize);
     //set the offset here
-    BOOL retStatus = SetFilePointerEx(device->os_info.fd, liDistanceToMove, &lpNewFilePointer, FILE_BEGIN);
+    BOOL retStatus = SetFilePointerEx(handleToUse, liDistanceToMove, &lpNewFilePointer, FILE_BEGIN);
     if (!retStatus)
     {
         if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
@@ -11830,31 +13337,39 @@ int os_Write(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32
     memset(&commandTimer, 0, sizeof(seatimer_t));
     OVERLAPPED overlappedStruct;
     memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-    overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
     overlappedStruct.Offset = M_DoubleWord0(lba * device->drive_info.deviceBlockSize);
     overlappedStruct.OffsetHigh = M_DoubleWord1(lba * device->drive_info.deviceBlockSize);
     SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
-    if (VERBOSITY_BUFFERS <= device->deviceVerbosity && ptrData != NULL)
+    if (VERBOSITY_BUFFERS <= device->deviceVerbosity && ptrData != M_NULLPTR)
     {
         printf("\t  Data Buffer being sent:\n");
         print_Data_Buffer(ptrData, dataSize, true);
         printf("\n");
     }
     start_Timer(&commandTimer);
-    retStatus = WriteFile(device->os_info.fd, ptrData, dataSize, &bytesReturned, &overlappedStruct);
+    retStatus = WriteFile(handleToUse, ptrData, dataSize, &bytesReturned, &overlappedStruct);
     device->os_info.last_error = GetLastError();
     if (ERROR_IO_PENDING == device->os_info.last_error)//This will only happen for overlapped commands. If the drive is opened without the overlapped flag, everything will work like old synchronous code.-TJE
     {
-        retStatus = GetOverlappedResult(device->os_info.fd, &overlappedStruct, &bytesReturned, TRUE);
+        retStatus = GetOverlappedResult(handleToUse, &overlappedStruct, &bytesReturned, TRUE);
     }
     else if (device->os_info.last_error != ERROR_SUCCESS)
     {
         ret = OS_PASSTHROUGH_FAILURE;
     }
+    if (forceUnitAccess && openFUA != SUCCESS)
+    {
+        //could not get a FUA handle...so emulate with a verify command after the write - TJE
+        os_Verify(device, lba, dataSize / device->drive_info.deviceBlockSize);
+    }
     stop_Timer(&commandTimer);
     device->os_info.last_error = GetLastError();
-    CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-    overlappedStruct.hEvent = NULL;
+    if (overlappedStruct.hEvent != M_NULLPTR && overlappedStruct.hEvent != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
+    }
+    overlappedStruct.hEvent = M_NULLPTR;
     device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
 
     if (!retStatus)//not successful
@@ -11875,114 +13390,12 @@ int os_Write(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32
         ret = FAILURE;
     }
 
-    //clear the last command sense data and rtfrs. We'll dummy them up in a minute
-    memset(&device->drive_info.lastCommandRTFRs, 0, sizeof(ataReturnTFRs));
-    memset(device->drive_info.lastCommandSenseData, 0, SPC3_SENSE_LEN);
+    ret = set_Command_Completion_For_OS_Read_Write(device, device->os_info.last_error);
 
-    if (retStatus)
-    {
-        //successful write
-        if (device->drive_info.drive_type == ATA_DRIVE)
-        {
-            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE;
-        }
-        ret = SUCCESS;
-    }
-    else
-    {
-        uint8_t senseKey = 0, asc = 0, ascq = 0;
-        ret = FAILURE;
-        //failure for one reason or another. The last error may or may not tell us exactly what happened.
-        if (device->drive_info.drive_type == ATA_DRIVE)
-        {
-            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_ERROR;
-        }
-        device->drive_info.lastCommandSenseData[0] = SCSI_SENSE_CUR_INFO_FIXED;
-
-        switch (device->os_info.last_error)
-        {
-            //Some of these are in here "just in case", but this is not a comprehensive list of what could be returned. Some may never be returned, others may not be in this list and are falling to the default case - TJE
-            //The only one I haven't been able to find a good answer for is an interface CRC error, which are hard to create and test for - TJE
-        case ERROR_NOT_READY://sense key not ready...not sure this matches anything in ATA if this even were to happen there.
-            senseKey = SENSE_KEY_NOT_READY;
-            //no other information can be provided
-            break;
-        case ERROR_WRITE_PROTECT:
-            senseKey = SENSE_KEY_DATA_PROTECT;
-            asc = 0x27;
-            ascq = 0x00;
-            //TODO: Not sure what to do about ATA here...there is not a direct translation
-            break;
-        case ERROR_WRITE_FAULT:
-        case ERROR_READ_FAULT:
-        case ERROR_DEVICE_HARDWARE_ERROR:
-            senseKey = SENSE_KEY_HARDWARE_ERROR;
-            asc = 0x44;
-            ascq = 0;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_DEVICE_FAULT;
-            }
-            break;
-        case ERROR_CRC: //medium error, uncorrectable data
-            senseKey = SENSE_KEY_MEDIUM_ERROR;
-            asc = 0x11;
-            ascq = 0;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_UNCORRECTABLE_DATA;
-            }
-            break;
-        case ERROR_SEEK://cannot find area or track on disk?
-            M_FALLTHROUGH //Fallthrough for now unless we can figure out a better, more specific error when this happens - TJE
-        case ERROR_SECTOR_NOT_FOUND://ID not found (beyond max LBA type error)
-            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
-            asc = 0x21;
-            ascq = 0x00;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_ID_NOT_FOUND;
-            }
-            break;
-        case ERROR_OFFSET_ALIGNMENT_VIOLATION://alignment error for the device
-            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
-            asc = 0x21;
-            ascq = 0x04;//technically this is "unaligned write command" which would not be accurate with a read, but this is the best I can do right now....maybe 07 for read boundary error???
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_ALIGNMENT_ERROR;
-            }
-            break;
-        case ERROR_TIMEOUT:
-            senseKey = SENSE_KEY_ABORTED_COMMAND;
-            ret = COMMAND_TIMEOUT;
-            break;
-        case ERROR_DEVICE_NOT_CONNECTED://CRC error???
-            senseKey = SENSE_KEY_MEDIUM_ERROR;
-            //INFORMATION UNIT iuCRC ERROR DETECTED
-            asc = 0x47;
-            ascq = 0x03;
-            break;
-        case ERROR_BAD_COMMAND:
-        case ERROR_INVALID_DATA://Not sure if this is the same as CRC or something else, so this may need changing if we see it in the future.
-        case ERROR_DATA_CHECKSUM_ERROR://Not sure if this will show up for RAW IO like this is doing or not, but we may need a case for this in the future.
-        default:
-            //set the sense key to aborted command...don't set the asc or ascq since we don't know what to set those to right now
-            senseKey = SENSE_KEY_ABORTED_COMMAND;
-            break;
-        }
-        device->drive_info.lastCommandSenseData[2] |= senseKey;
-        if (asc || ascq)
-        {
-            device->drive_info.lastCommandSenseData[7] = 6;//get to bytes 12 & 13 for asc info...or should this change to a value of 7 to include fru, even though that is impossible for us to figure out??? - TJE
-            device->drive_info.lastCommandSenseData[12] = asc;
-            device->drive_info.lastCommandSenseData[13] = ascq;
-        }
-    }
     //check for command timeout
     if ((device->drive_info.lastCommandTimeNanoSeconds / 1000000000) >= timeoutInSeconds)
     {
-        ret = COMMAND_TIMEOUT;
+        ret = OS_COMMAND_TIMEOUT;
     }
     if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
     {
@@ -11993,9 +13406,9 @@ int os_Write(tDevice *device, uint64_t lba, bool async, uint8_t *ptrData, uint32
 #if WINVER >= SEA_WIN32_WINNT_WINXP
 //IOCTL is for Win XP and higher
 //Seems to work. Needs some enhancements with timers and checking return codes more closely to dummy up better sense data.
-int os_Verify(tDevice *device, uint64_t lba, uint32_t range)
+eReturnValues os_Verify(tDevice *device, uint64_t lba, uint32_t range)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
     if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
     {
         printf("Using Windows API to Verify LBAs\n");
@@ -12018,7 +13431,7 @@ int os_Verify(tDevice *device, uint64_t lba, uint32_t range)
     DWORD returnedBytes = 0;
     OVERLAPPED overlappedStruct;
     memset(&overlappedStruct, 0, sizeof(OVERLAPPED));
-    overlappedStruct.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    overlappedStruct.hEvent = CreateEvent(M_NULLPTR, TRUE, FALSE, M_NULLPTR);
     overlappedStruct.Offset = M_DoubleWord0(lba * device->drive_info.deviceBlockSize);
     overlappedStruct.OffsetHigh = M_DoubleWord1(lba * device->drive_info.deviceBlockSize);
     SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
@@ -12027,7 +13440,7 @@ int os_Verify(tDevice *device, uint64_t lba, uint32_t range)
         IOCTL_DISK_VERIFY,
         &verifyCmd,
         sizeof(VERIFY_INFORMATION),
-        NULL,
+        M_NULLPTR,
         0,
         &returnedBytes,
         &overlappedStruct);
@@ -12053,112 +13466,9 @@ int os_Verify(tDevice *device, uint64_t lba, uint32_t range)
     if (overlappedStruct.hEvent)
     {
         CloseHandle(overlappedStruct.hEvent);//close the overlapped handle since it isn't needed any more...-TJE
-        overlappedStruct.hEvent = NULL;
+        overlappedStruct.hEvent = M_NULLPTR;
     }
-    //clear the last command sense data and rtfrs. We'll dummy them up in a minute
-    memset(&device->drive_info.lastCommandRTFRs, 0, sizeof(ataReturnTFRs));
-    memset(device->drive_info.lastCommandSenseData, 0, SPC3_SENSE_LEN);
-    if (success)
-    {
-        //successful verify
-        if (device->drive_info.drive_type == ATA_DRIVE)
-        {
-            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE;
-        }
-        ret = SUCCESS;
-    }
-    else
-    {
-        uint8_t senseKey = 0, asc = 0, ascq = 0;
-        ret = FAILURE;
-        //failure for one reason or another. The last error may or may not tell us exactly what happened.
-        if (device->drive_info.drive_type == ATA_DRIVE)
-        {
-            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_ERROR;
-        }
-        device->drive_info.lastCommandSenseData[0] = SCSI_SENSE_CUR_INFO_FIXED;
-        //below are the error codes windows driver site says we can get https://msdn.microsoft.com/en-us/library/windows/hardware/ff560420(v=vs.85).aspx
-        //NOTE: Translated to last error codes as best we can
-        switch (device->os_info.last_error)
-        {
-            //Some of these are in here "just in case", but this is not a comprehensive list of what could be returned. Some may never be returned, others may not be in this list and are falling to the default case - TJE
-            //The only one I haven't been able to find a good answer for is an interface CRC error, which are hard to create and test for - TJE
-        case ERROR_NOT_READY://sense key not ready...not sure this matches anything in ATA if this even were to happen there.
-            senseKey = SENSE_KEY_NOT_READY;
-            //no other information can be provided
-            break;
-        case ERROR_WRITE_PROTECT:
-            senseKey = SENSE_KEY_DATA_PROTECT;
-            asc = 0x27;
-            ascq = 0x00;
-            //TODO: Not sure what to do about ATA here...there is not a direct translation
-            break;
-        case ERROR_WRITE_FAULT:
-        case ERROR_READ_FAULT:
-        case ERROR_DEVICE_HARDWARE_ERROR:
-            senseKey = SENSE_KEY_HARDWARE_ERROR;
-            asc = 0x44;
-            ascq = 0;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_DEVICE_FAULT;
-            }
-            break;
-        case ERROR_CRC: //medium error, uncorrectable data
-            senseKey = SENSE_KEY_MEDIUM_ERROR;
-            asc = 0x11;
-            ascq = 0;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_UNCORRECTABLE_DATA;
-            }
-            break;
-        case ERROR_SEEK://cannot find area or track on disk?
-            M_FALLTHROUGH //Fallthrough for now unless we can figure out a better, more specific error when this happens - TJE
-        case ERROR_SECTOR_NOT_FOUND://ID not found (beyond max LBA type error)
-            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
-            asc = 0x21;
-            ascq = 0x00;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_ID_NOT_FOUND;
-            }
-            break;
-        case ERROR_OFFSET_ALIGNMENT_VIOLATION://alignment error for the device
-            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
-            asc = 0x21;
-            ascq = 0x04;//technically this is "unaligned write command" which would not be accurate with a read, but this is the best I can do right now....maybe 07 for read boundary error???
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_ALIGNMENT_ERROR;
-            }
-            break;
-        case ERROR_TIMEOUT:
-            senseKey = SENSE_KEY_ABORTED_COMMAND;
-            ret = COMMAND_TIMEOUT;
-            break;
-        case ERROR_DEVICE_NOT_CONNECTED://CRC error???
-            senseKey = SENSE_KEY_MEDIUM_ERROR;
-            //INFORMATION UNIT iuCRC ERROR DETECTED
-            asc = 0x47;
-            ascq = 0x03;
-            break;
-        case ERROR_BAD_COMMAND:
-        case ERROR_INVALID_DATA://Not sure if this is the same as CRC or something else, so this may need changing if we see it in the future.
-        case ERROR_DATA_CHECKSUM_ERROR://Not sure if this will show up for RAW IO like this is doing or not, but we may need a case for this in the future.
-        default:
-            //set the sense key to aborted command...don't set the asc or ascq since we don't know what to set those to right now
-            senseKey = SENSE_KEY_ABORTED_COMMAND;
-            break;
-        }
-        device->drive_info.lastCommandSenseData[2] |= senseKey;
-        if (asc || ascq)
-        {
-            device->drive_info.lastCommandSenseData[7] = 6;//get to bytes 12 & 13 for asc info...or should this change to a value of 7 to include fru, even though that is impossible for us to figure out??? - TJE
-            device->drive_info.lastCommandSenseData[12] = asc;
-            device->drive_info.lastCommandSenseData[13] = ascq;
-        }
-    }
+    ret = set_Command_Completion_For_OS_Read_Write(device, device->os_info.last_error);
     device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(verifyTimer);
     if (device->deviceVerbosity >= VERBOSITY_COMMAND_VERBOSE)
     {
@@ -12167,7 +13477,7 @@ int os_Verify(tDevice *device, uint64_t lba, uint32_t range)
     //check for command timeout
     if ((device->drive_info.lastCommandTimeNanoSeconds / 1000000000) >= timeoutInSeconds)
     {
-        ret = COMMAND_TIMEOUT;
+        ret = OS_COMMAND_TIMEOUT;
     }
     if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
     {
@@ -12177,16 +13487,17 @@ int os_Verify(tDevice *device, uint64_t lba, uint32_t range)
 }
 #else
 //verify IOTCL is not available so we need to just do a flush and a read.
-int os_Verify(tDevice *device, uint64_t lba, uint32_t range)
+eReturnValues os_Verify(tDevice *device, uint64_t lba, uint32_t range)
 {
     //flush the cache first to make sure we aren't reading something that is in cache than disk (as close as we can get right here)
     os_Flush(device);
     //now do a read and throw away the data
-    uint8_t *readData = C_CAST(uint8_t*, malloc(device->drive_info.deviceBlockSize * range));
+    uint8_t *readData = C_CAST(uint8_t*, safe_malloc(device->drive_info.deviceBlockSize * range));
     if (readData)
     {
+        memset(readData, 0, device->drive_info.deviceBlockSize * range);
         ret = os_Read(device, lba, false, readData, device->drive_info.deviceBlockSize * range);
-        safe_Free(readData)
+        safe_free(&readData);
     }
     else
     {
@@ -12197,9 +13508,9 @@ int os_Verify(tDevice *device, uint64_t lba, uint32_t range)
 #endif
 
 //This is for Windows XP and higher. This should issue a flush cache or synchronize cache command for us
-int os_Flush(tDevice *device)
+eReturnValues os_Flush(tDevice *device)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
     {
         printf("Using Windows API to Flush Cache\n");
@@ -12230,7 +13541,7 @@ int os_Flush(tDevice *device)
     memset(&commandTimer, 0, sizeof(seatimer_t));
     SetLastError(ERROR_SUCCESS);//clear any cached errors before we try to send the command
     start_Timer(&commandTimer);
-    int retStatus = FlushFileBuffers(device->os_info.fd);
+    BOOL retStatus = FlushFileBuffers(device->os_info.fd);
     device->os_info.last_error = GetLastError();
     if (device->os_info.last_error != ERROR_SUCCESS)
     {
@@ -12244,6 +13555,11 @@ int os_Flush(tDevice *device)
             printf("Windows Error: ");
             print_Windows_Error_To_Screen(device->os_info.last_error);
         }
+        ret = FAILURE;
+    }
+    else
+    {
+        ret = SUCCESS;
     }
 
     device->drive_info.lastCommandTimeNanoSeconds = get_Nano_Seconds(commandTimer);
@@ -12251,115 +13567,12 @@ int os_Flush(tDevice *device)
     {
         print_Command_Time(device->drive_info.lastCommandTimeNanoSeconds);
     }
-    //clear the last command sense data and rtfrs. We'll dummy them up in a minute
-    memset(&device->drive_info.lastCommandRTFRs, 0, sizeof(ataReturnTFRs));
-    memset(device->drive_info.lastCommandSenseData, 0, SPC3_SENSE_LEN);
-
-    if (retStatus)
-    {
-        //successful read
-        if (device->drive_info.drive_type == ATA_DRIVE)
-        {
-            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_SEEK_COMPLETE;
-        }
-        ret = SUCCESS;
-    }
-    else
-    {
-        uint8_t senseKey = 0, asc = 0, ascq = 0;
-        ret = FAILURE;
-        //failure for one reason or another. The last error may or may not tell us exactly what happened.
-        if (device->drive_info.drive_type == ATA_DRIVE)
-        {
-            device->drive_info.lastCommandRTFRs.status = ATA_STATUS_BIT_READY | ATA_STATUS_BIT_ERROR;
-        }
-        device->drive_info.lastCommandSenseData[0] = SCSI_SENSE_CUR_INFO_FIXED;
-
-        switch (device->os_info.last_error)
-        {
-            //Some of these are in here "just in case", but this is not a comprehensive list of what could be returned. Some may never be returned, others may not be in this list and are falling to the default case - TJE
-            //The only one I haven't been able to find a good answer for is an interface CRC error, which are hard to create and test for - TJE
-        case ERROR_NOT_READY://sense key not ready...not sure this matches anything in ATA if this even were to happen there.
-            senseKey = SENSE_KEY_NOT_READY;
-            //no other information can be provided
-            break;
-        case ERROR_WRITE_PROTECT:
-            senseKey = SENSE_KEY_DATA_PROTECT;
-            asc = 0x27;
-            ascq = 0x00;
-            //TODO: Not sure what to do about ATA here...there is not a direct translation
-            break;
-        case ERROR_WRITE_FAULT:
-        case ERROR_READ_FAULT:
-        case ERROR_DEVICE_HARDWARE_ERROR:
-            senseKey = SENSE_KEY_HARDWARE_ERROR;
-            asc = 0x44;
-            ascq = 0;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_DEVICE_FAULT;
-            }
-            break;
-        case ERROR_CRC: //medium error, uncorrectable data
-            senseKey = SENSE_KEY_MEDIUM_ERROR;
-            asc = 0x11;
-            ascq = 0;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_UNCORRECTABLE_DATA;
-            }
-            break;
-        case ERROR_SEEK://cannot find area or track on disk?
-            M_FALLTHROUGH //Fallthrough for now unless we can figure out a better, more specific error when this happens - TJE
-        case ERROR_SECTOR_NOT_FOUND://ID not found (beyond max LBA type error)
-            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
-            asc = 0x21;
-            ascq = 0x00;
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.error |= ATA_ERROR_BIT_ID_NOT_FOUND;
-            }
-            break;
-        case ERROR_OFFSET_ALIGNMENT_VIOLATION://alignment error for the device
-            senseKey = SENSE_KEY_ILLEGAL_REQUEST;
-            asc = 0x21;
-            ascq = 0x04;//technically this is "unaligned write command" which would not be accurate with a read, but this is the best I can do right now....maybe 07 for read boundary error???
-            if (device->drive_info.drive_type == ATA_DRIVE)
-            {
-                device->drive_info.lastCommandRTFRs.status |= ATA_STATUS_BIT_ALIGNMENT_ERROR;
-            }
-            break;
-        case ERROR_TIMEOUT:
-            senseKey = SENSE_KEY_ABORTED_COMMAND;
-            ret = COMMAND_TIMEOUT;
-            break;
-        case ERROR_DEVICE_NOT_CONNECTED://CRC error???
-            senseKey = SENSE_KEY_MEDIUM_ERROR;
-            //INFORMATION UNIT iuCRC ERROR DETECTED
-            asc = 0x47;
-            ascq = 0x03;
-            break;
-        case ERROR_BAD_COMMAND:
-        case ERROR_INVALID_DATA://Not sure if this is the same as CRC or something else, so this may need changing if we see it in the future.
-        case ERROR_DATA_CHECKSUM_ERROR://Not sure if this will show up for RAW IO like this is doing or not, but we may need a case for this in the future.
-        default:
-            //set the sense key to aborted command...don't set the asc or ascq since we don't know what to set those to right now
-            senseKey = SENSE_KEY_ABORTED_COMMAND;
-            break;
-        }
-        device->drive_info.lastCommandSenseData[2] |= senseKey;
-        if (asc || ascq)
-        {
-            device->drive_info.lastCommandSenseData[7] = 6;//get to bytes 12 & 13 for asc info...or should this change to a value of 7 to include fru, even though that is impossible for us to figure out??? - TJE
-            device->drive_info.lastCommandSenseData[12] = asc;
-            device->drive_info.lastCommandSenseData[13] = ascq;
-        }
-    }
+    ret = set_Command_Completion_For_OS_Read_Write(device, device->os_info.last_error);
 
     //check for command timeout
     if ((device->drive_info.lastCommandTimeNanoSeconds / 1000000000) >= timeoutInSeconds)
     {
-        ret = COMMAND_TIMEOUT;
+        ret = OS_COMMAND_TIMEOUT;
     }
     if (VERBOSITY_COMMAND_VERBOSE <= device->deviceVerbosity)
     {

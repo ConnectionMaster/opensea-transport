@@ -153,6 +153,9 @@
     <ClInclude Include="..\..\..\..\include\raid_scan_helper.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\..\..\include\realtek_nvme_helper.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\..\..\src\ata_cmds.c">
@@ -254,10 +257,8 @@
     <ClCompile Include="..\..\..\..\src\raid_scan_helper.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="..\..\..\..\src\cppdeps.pl">
+    <ClCompile Include="..\..\..\..\src\realtek_nvme_helper.c">
       <Filter>Source Files</Filter>
-    </None>
+    </ClCompile>
   </ItemGroup>
 </Project>

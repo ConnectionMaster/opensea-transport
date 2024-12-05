@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -17,16 +18,13 @@
 #include "intel_rst_defs.h"
 #include "scsi_helper.h"
 
-#if !defined (DISABLE_NVME_PASSTHROUGH)
 #include "nvme_helper.h"
-#endif
 
 #if defined (__cplusplus)
 extern "C"
 {
 #endif
 
-#if !defined (DISABLE_NVME_PASSTHROUGH)
     //-----------------------------------------------------------------------------
     //
     //  send_Intel_NVM_Command(nvmeCmdCtx *nvmeIoCtx)
@@ -43,7 +41,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int send_Intel_NVM_Command(nvmeCmdCtx *nvmeIoCtx);
+    OPENSEA_TRANSPORT_API eReturnValues send_Intel_NVM_Command(nvmeCmdCtx *nvmeIoCtx);
 
     //-----------------------------------------------------------------------------
     //
@@ -59,7 +57,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int send_Intel_NVM_Firmware_Download(nvmeCmdCtx *nvmeIoCtx);
+    OPENSEA_TRANSPORT_API eReturnValues send_Intel_NVM_Firmware_Download(nvmeCmdCtx *nvmeIoCtx);
 
     //-----------------------------------------------------------------------------
     //
@@ -75,8 +73,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int send_Intel_NVM_SCSI_Command(ScsiIoCtx *scsiIoCtx);
-#endif
+    OPENSEA_TRANSPORT_API eReturnValues send_Intel_NVM_SCSI_Command(ScsiIoCtx *scsiIoCtx);
 
     //-----------------------------------------------------------------------------
     //
@@ -108,10 +105,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int send_Intel_Firmware_Download(ScsiIoCtx *scsiIoCtx);
-
-    //TODO: Define other Intel RST unique calls here based on what is in intel_rst_defs.h
-
+    OPENSEA_TRANSPORT_API eReturnValues send_Intel_Firmware_Download(ScsiIoCtx *scsiIoCtx);
 
 #if defined (__cplusplus)
 }

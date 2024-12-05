@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -16,9 +17,12 @@
 
 #if defined (ENABLE_CSMI)
 
-#include "common.h"
+#include "common_types.h"
 #include <stdint.h>
-#include "csmisas.h"
+#if defined (_WIN32) && !defined(_NTDDSCSIH_)
+    #include <ntddscsi.h>
+#endif
+#include "external/csmi/csmisas.h"
 #include "scsi_helper.h"
 #include "csmi_helper.h"
 #include "sata_types.h"
@@ -46,7 +50,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_Driver_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_DRIVER_INFO_BUFFER driverInfoBuffer, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_Driver_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_DRIVER_INFO_BUFFER driverInfoBuffer, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -65,7 +69,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_Controller_Configuration(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_CNTLR_CONFIG_BUFFER ctrlConfigBuffer, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_Controller_Configuration(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_CNTLR_CONFIG_BUFFER ctrlConfigBuffer, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -84,7 +88,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_Controller_Status(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_CNTLR_STATUS_BUFFER ctrlStatusBuffer, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_Controller_Status(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_CNTLR_STATUS_BUFFER ctrlStatusBuffer, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -106,7 +110,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Controller_Firmware_Download(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_FIRMWARE_DOWNLOAD_BUFFER firmwareBuffer, uint32_t firmwareBufferTotalLength, uint32_t downloadFlags, eVerbosityLevels verbosity, uint32_t timeoutSeconds);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Controller_Firmware_Download(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_FIRMWARE_DOWNLOAD_BUFFER firmwareBuffer, uint32_t firmwareBufferTotalLength, uint32_t downloadFlags, eVerbosityLevels verbosity, uint32_t timeoutSeconds);
 
     //-----------------------------------------------------------------------------
     //
@@ -125,7 +129,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_RAID_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_RAID_INFO_BUFFER raidInfoBuffer, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_RAID_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_RAID_INFO_BUFFER raidInfoBuffer, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -147,7 +151,26 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_RAID_Config(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_RAID_CONFIG_BUFFER raidConfigBuffer, uint32_t raidConfigBufferTotalSize, uint32_t raidSetIndex, uint8_t dataType, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_RAID_Config(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_RAID_CONFIG_BUFFER raidConfigBuffer, uint32_t raidConfigBufferTotalSize, uint32_t raidSetIndex, uint8_t dataType, eVerbosityLevels verbosity);
+
+    //-----------------------------------------------------------------------------
+    //
+    //  csmi_Get_RAID_Features(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_RAID_FEATURES_BUFFER raidFeaturesBuffer, eVerbosityLevels verbosity)
+    //
+    //! \brief   Description:  Sends the CSMI Get RAID Features IOCTL. This is not supported on many CSMI RAIDs as it was not part of the original CSMI proposal.
+    //
+    //  Entry:
+    //!   \param[in] deviceHandle - operating system device handle value. Opened as \\.\SCSIX: on Windows, /dev/<hba> on other OSs
+    //!   \param[in] controllerNumber - Linux only, controller number since Linux needs this in the IOCTL_HEADER
+    //!   \param[in] raidFeaturesBuffer - CSMI spec buffer to use. This should be empty.
+    //!   \param[in] verbosity - the level of verbose output to use when performing this IO
+    //! 
+    //!
+    //  Exit:
+    //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
+    //
+    //-----------------------------------------------------------------------------
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_RAID_Features(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_RAID_FEATURES_BUFFER raidFeaturesBuffer, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -166,7 +189,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_Phy_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_PHY_INFO_BUFFER phyInfoBuffer, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_Phy_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_PHY_INFO_BUFFER phyInfoBuffer, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -185,7 +208,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Set_Phy_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_SET_PHY_INFO_BUFFER phyInfoBuffer, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Set_Phy_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_SET_PHY_INFO_BUFFER phyInfoBuffer, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -206,7 +229,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_Link_Errors(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_LINK_ERRORS_BUFFER linkErrorsBuffer, uint8_t phyIdentifier, bool resetCounts, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_Link_Errors(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_LINK_ERRORS_BUFFER linkErrorsBuffer, uint8_t phyIdentifier, bool resetCounts, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -226,7 +249,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_SATA_Signature(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_SATA_SIGNATURE_BUFFER sataSignatureBuffer, uint8_t phyIdentifier, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_SATA_Signature(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_SATA_SIGNATURE_BUFFER sataSignatureBuffer, uint8_t phyIdentifier, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -247,7 +270,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_SCSI_Address(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_GET_SCSI_ADDRESS_BUFFER scsiAddressBuffer, uint8_t sasAddress[8], uint8_t lun[8], eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_SCSI_Address(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_GET_SCSI_ADDRESS_BUFFER scsiAddressBuffer, uint8_t sasAddress[8], uint8_t lun[8], eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -270,7 +293,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_Device_Address(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_GET_DEVICE_ADDRESS_BUFFER deviceAddressBuffer, uint8_t hostIndex, uint8_t path, uint8_t target, uint8_t lun, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_Device_Address(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_GET_DEVICE_ADDRESS_BUFFER deviceAddressBuffer, uint8_t hostIndex, uint8_t path, uint8_t target, uint8_t lun, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -289,7 +312,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int csmi_Get_Connector_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_CONNECTOR_INFO_BUFFER connectorInfoBuffer, eVerbosityLevels verbosity);
+    OPENSEA_TRANSPORT_API eReturnValues csmi_Get_Connector_Info(CSMI_HANDLE deviceHandle, uint32_t controllerNumber, PCSMI_SAS_CONNECTOR_INFO_BUFFER connectorInfoBuffer, eVerbosityLevels verbosity);
 
     //-----------------------------------------------------------------------------
     //
@@ -305,7 +328,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int send_CSMI_IO(ScsiIoCtx *scsiIoCtx);
+    OPENSEA_TRANSPORT_API eReturnValues send_CSMI_IO(ScsiIoCtx *scsiIoCtx);
 
     //-----------------------------------------------------------------------------
     //
@@ -362,7 +385,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int jbod_Setup_CSMI_Info(CSMI_HANDLE deviceHandle, tDevice *device, uint8_t controllerNumber, uint8_t hostController, uint8_t pathidBus, uint8_t targetID, uint8_t lun);
+    OPENSEA_TRANSPORT_API eReturnValues jbod_Setup_CSMI_Info(CSMI_HANDLE deviceHandle, tDevice *device, uint8_t controllerNumber, uint8_t hostController, uint8_t pathidBus, uint8_t targetID, uint8_t lun);
 
     //-----------------------------------------------------------------------------
     //
@@ -381,7 +404,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int get_CSMI_RAID_Device_Count(uint32_t * numberOfDevices, uint64_t flags, ptrRaidHandleToScan *beginningOfList);
+    OPENSEA_TRANSPORT_API eReturnValues get_CSMI_RAID_Device_Count(uint32_t * numberOfDevices, uint64_t flags, ptrRaidHandleToScan *beginningOfList);
 
     //-----------------------------------------------------------------------------
     //
@@ -401,7 +424,7 @@ extern "C"
     //!   \return SUCCESS = pass, OS_COMMAND_NOT_AVAILABLE = not support in this OS or driver of the device, OS_COMMAND_BLOCKED = Command not allowed, all others = other failures.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int get_CSMI_RAID_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versionBlock ver, uint64_t flags, ptrRaidHandleToScan *beginningOfList);
+    OPENSEA_TRANSPORT_API eReturnValues get_CSMI_RAID_Device_List(tDevice * const ptrToDeviceList, uint32_t sizeInBytes, versionBlock ver, uint64_t flags, ptrRaidHandleToScan *beginningOfList);
 
     //-----------------------------------------------------------------------------
     //
@@ -431,7 +454,7 @@ extern "C"
     //!   \return SUCCESS = sucessfully closed the handle, else something else went wrong or not a CSMI device to close a handle for.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int close_CSMI_RAID_Device(tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues close_CSMI_RAID_Device(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -449,7 +472,7 @@ extern "C"
     //!   \return SUCCESS = sucessfully opened CSMI device, else something went wrong while trying to open the device.
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_TRANSPORT_API int get_CSMI_RAID_Device(const char *filename, tDevice *device);
+    OPENSEA_TRANSPORT_API eReturnValues get_CSMI_RAID_Device(const char *filename, tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
