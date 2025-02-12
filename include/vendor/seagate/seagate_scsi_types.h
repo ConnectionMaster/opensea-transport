@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -32,57 +33,55 @@ extern "C"
     #define SEAGATE_INQ_COPYRIGHT_OFFSET UINT8_C(96)
     #define SEAGATE_INQ_COPYRIGHT_LENGTH UINT8_C(48)
 
-    typedef enum _eSeagateVPDPages
+    typedef enum eSeagateVPDPagesEnum
     {
         SEAGATE_VPD_FIRMWARE_NUMBERS    = 0xC0,
         SEAGATE_VPD_DATE_CODE           = 0xC1,
         SEAGATE_VPD_JUMPER_SETTINGS     = 0xC2,
         SEAGATE_VPD_DEVICE_BEHAVIOR     = 0xC3,
-        //TODO: any other Seagate Unique VPD pages
     }eSeagateVPDPages;
 
-    typedef enum _eSeagateModePages
+    typedef enum eSeagateModePagesEnum
     {
         SEAGATE_MP_UNIT_ATTENTION_PARAMETERS    = 0x00,
-        //TODO: any other Seagate unique mode pages
     }eSeagateModePages;
 
     //Seagate unique protocol specific mode page sub pages
-    typedef enum _eSeagateProtocolMPSP
+    typedef enum eSeagateProtocolMPSPEnum
     {
         SEAGATE_MP_SP_SAS_TRANCEIVER_CONTROL_OUT    = 0xE5, //page 19h
         SEAGATE_MP_SP_SAS_TRANCEIVER_CONTROL_IN     = 0xE6, //page 19h
-        //TODO: other protocol specific mode page subpages
     }eSeagateProtocolMPSP;
 
-    typedef enum _eSeagateLogPages //not subpages. Unique subpages should be in a different enum, similar to protocol specific MP above
+    typedef enum eSeagateLogPagesEnum //not subpages. Unique subpages should be in a different enum, similar to protocol specific MP above
     {
         SEAGATE_LP_CACHE_STATISTICS = 0x37,
         SEAGATE_LP_FACTORY_LOG      = 0x3E,
         SEAGATE_LP_FARM             = 0x3D, //must use subpages.
-        //TODO: other Seagate log pages
     }eSeagateLogPages;
 
-    typedef enum _eSeagateFARMSP
+    typedef enum eSeagateFARMSPEnum
     {
         SEAGATE_FARM_SP_CURRENT = 0x03,
         SEAGATE_FARM_SP_FACTORY = 0x04,
+		SEAGATE_FARM_SP_TIME_SERIES_START = 0x10,
+		SEAGATE_FARM_SP_TIME_SERIES_END = 0x1F,
+		SEAGATE_FARM_SP_TIME_SERIES_ADD1 = 0xC0,
+		SEAGATE_FARM_SP_TIME_SERIES_ADD2 = 0xC1,
+		SEAGATE_FARM_SP_STICKY_START = 0xC2,
+		SEAGATE_FARM_SP_STICKY_END = 0xC7,
     }eSeagateFARMSP;
 
-    typedef enum _eSeagateDiagnosticPages
+    typedef enum eSeagateDiagnosticPagesEnum
     {
         SEAGATE_DIAG_IN_DRIVE_DIAGNOSTICS = 0x98,
         SEAGATE_DIAG_POWER_MEASUREMENT    = 0x99,
-        //TODO: other Seagate diagnostic pages
     }eSeagateDiagnosticPages;
 
-    typedef enum _eSeagateErrorHistoryBuffers
+    typedef enum eSeagateErrorHistoryBuffersEnum
     {
         SEAGATE_ERR_HIST_POWER_TELEMETRY    = 0x54,
-        //TODO: other Seagate error history buffer IDs
     }eSeagateErrorHistoryBuffers;
-
-    //TODO: Seagate unique Sense data information
 
 #if defined(__cplusplus)
 }
